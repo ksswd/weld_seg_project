@@ -13,6 +13,8 @@ class Config:
     RADIUS_RATIO = 2.0
 
     # --- Model Architecture ---
+    # Type of side gate to use
+    SIDE_GATE_TYPE = "qwen"
     # Input feature channels (from preprocessed features: x,y,z,nx,ny,nz,kappa,rho)
     INPUT_DIM = 8
     # Internal model feature dimension. Must be divisible by N_HEADS.

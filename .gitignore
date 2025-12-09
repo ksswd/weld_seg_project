@@ -3,3 +3,5 @@ data/
 *.pyc
 logs/**
 chosen.zip
+label_process.zip
+**.out

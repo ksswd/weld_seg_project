@@ -74,7 +74,7 @@ def run_pretrain(config):
     criterion = nn.MSELoss(reduction='none')
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.NUM_EPOCHS)
-    scaler = torch.amp.GradScaler() if getattr(config, 'USE_AMP', False) and device.type == 'cuda' else None
+    scaler = torch.amp.GradScaler(device="cuda") if getattr(config, 'USE_AMP', False) and device.type == 'cuda' else None
     writer = SummaryWriter(os.path.join(getattr(config, 'LOG_DIR', 'logs'), 'pretrain'))
     best_loss = float('inf')
     os.makedirs(config.WEIGHTS_SAVE_DIR, exist_ok=True)
@@ -102,7 +102,7 @@ def run_pretrain(config):
 
             # 3) 前向 + 反向（考虑 AMP）
             if scaler:
-                with torch.amp.autocast():
+                with torch.amp.autocast(device_type="cuda"):
                     recon = model(masked_feat, batch['principal_dir'], batch['curvature'],
                                   batch['local_density'], batch['normals'], batch['linearity'], task='recon')
                     if not torch.isfinite(recon).all():

@@ -49,6 +49,7 @@ class GeometryAwareTransformer(nn.Module):
         for block in self.attention_layers:
             x = block(
                 x,
+                coordinate=features[..., :3],
                 principal_dir=principal_dir,
                 curvature=curvature,
                 density=density,

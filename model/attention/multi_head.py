@@ -31,7 +31,7 @@ class MultiHeadGeometryAttention(nn.Module):
             raise ValueError(f"Unsupported SIDE_GATE_TYPE: {config.SIDE_GATE_TYPE}. "
                              "Choose 'priori' or 'qwen'.")
 
-    def forward(self, x, principal_dir, curvature, density, normals, linearity):
+    def forward(self, x, coordinate, principal_dir, curvature, density, normals, linearity):
         B, N, C = x.shape
 
         qkv = self.qkv_proj(x)
@@ -54,12 +54,12 @@ class MultiHeadGeometryAttention(nn.Module):
         # attn_score shape: (B, n_heads, N, N)
         attn_score = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
-        aniso_dist = self.aniso_dist(x[..., :3], principal_dir, linearity)
+        aniso_dist = self.aniso_dist(coordinate, principal_dir, linearity)
         geom_bias = self.geom_bias(curvature, density, normals, linearity, aniso_dist)
         
         # Apply bias and gate
         if self.side_gate_type == 'priori':
-            side_gate = self.side_gate(x[..., :3], principal_dir, normals, density)
+            side_gate = self.side_gate(coordinate, principal_dir, normals, density)
             attn_score = attn_score + geom_bias.unsqueeze(1)
             attn_score = attn_score * side_gate.unsqueeze(1)
             attn_weight = F.softmax(attn_score, dim=-1)
