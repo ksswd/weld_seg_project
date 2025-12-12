@@ -10,7 +10,7 @@ def test_model(config):
 
     test_files = [os.path.join(config.TEST_DATA_DIR, f)
                   for f in os.listdir(config.TEST_DATA_DIR)
-                  if f.endswith('.npz')]
+                  if f.endswith('.npz') and not f.startswith('T1') and not f.startswith('T2') and not f.startswith('T3')]
 
     max_points = getattr(config, 'MAX_POINTS', None)
 

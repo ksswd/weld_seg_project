@@ -6,6 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model.model import GeometryAwareTransformer
 from train.mask_strategy import HighCurvatureMasker
 from utils.config import Config as GlobalConfig
+from utils.downsampling import fps
 
 class WeldDataset(Dataset):
     def __init__(self, file_list):
@@ -26,42 +27,69 @@ class WeldDataset(Dataset):
             'features': feat, 'normals': normals, 'curvature': curvature,
             'local_density': local_density, 'principal_dir': principal_dir, 'linearity': linearity
         }
-
+        
 def collate_fn(batch):
     global_max = getattr(GlobalConfig, 'MAX_POINTS', None)
+    # 取 batch 里的最大点数，但最终采样到 global_max
     max_pts = max(item['features'].shape[0] for item in batch)
-    max_pts = min(max_pts, global_max) if global_max else max_pts
-    def pad(arr_list, shape):
-        out = np.full(shape, 0.0, dtype=np.float32)
-        for i, arr in enumerate(arr_list):
-            n = min(arr.shape[0], shape[1])
-            out[i, :n] = arr[:n]
-        return out
-    b, c = len(batch), batch[0]['features'].shape[1]
-    feats = pad([b['features'] for b in batch], (b, max_pts, c))
-    normals = pad([b['normals'] for b in batch], (b, max_pts, 3))
-    principal = pad([b['principal_dir'] for b in batch], (b, max_pts, 3))
-    curvature = pad([b['curvature'] for b in batch], (b, max_pts, 1))
-    density = pad([b['local_density'] for b in batch], (b, max_pts, 1))
-    linearity = pad([b['linearity'] for b in batch], (b, max_pts, 1))
-    mask = torch.zeros(b, max_pts, dtype=torch.bool)
-    for i, item in enumerate(batch):
-        mask[i, :item['features'].shape[0]] = 1
+    M = min(max_pts, global_max) if global_max else max_pts
+    # 准备列表
+    feats_list = []
+    normals_list = []
+    principal_list = []
+    curvature_list = []
+    density_list = []
+    linearity_list = []
+    for item in batch:
+        # ---- 1) 把所有字段先放到 GPU ----
+        feats = torch.from_numpy(item['features']).cuda()
+        normals = torch.from_numpy(item['normals']).cuda()
+        principal = torch.from_numpy(item['principal_dir']).cuda()
+        curvature = torch.from_numpy(item['curvature']).cuda()
+        density = torch.from_numpy(item['local_density']).cuda()
+        linearity = torch.from_numpy(item['linearity']).cuda()
+
+        # ---- 2) FPS（只用 xyz = feats[:, :3]）----
+        idx = fps(feats[:, :3], M)
+
+        # ---- 3) 同步采样所有 field ----
+        feats = feats[idx]
+        normals = normals[idx]
+        principal = principal[idx]
+        curvature = curvature[idx]
+        density = density[idx]
+        linearity = linearity[idx]
+
+        # ---- 4) 放入 batch 列表 ----
+        feats_list.append(feats)
+        normals_list.append(normals)
+        principal_list.append(principal)
+        curvature_list.append(curvature)
+        density_list.append(density)
+        linearity_list.append(linearity)
+
+    # ---- 5) stack 成 final batch ----
+    feats     = torch.stack(feats_list, dim=0)
+    normals   = torch.stack(normals_list, dim=0)
+    principal = torch.stack(principal_list, dim=0)
+    curvature = torch.stack(curvature_list, dim=0)
+    density   = torch.stack(density_list, dim=0)
+    linearity = torch.stack(linearity_list, dim=0)
+
     return {
-        'features': torch.from_numpy(feats),
-        'normals': torch.from_numpy(normals),
-        'principal_dir': torch.from_numpy(principal),
-        'curvature': torch.from_numpy(curvature),
-        'local_density': torch.from_numpy(density),
-        'linearity': torch.from_numpy(linearity),
-        'mask': mask
+        "features": feats,
+        "normals": normals,
+        "principal_dir": principal,
+        "curvature": curvature,
+        "local_density": density,
+        "linearity": linearity,
     }
 
 def run_pretrain(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     all_files = [os.path.join(config.PROCESSED_DATA_DIR, f)
                  for f in os.listdir(config.PROCESSED_DATA_DIR)
-                 if f.endswith('.npz') and '_pred' not in f]
+                 if f.endswith('.npz') and '_pred' not in f and not f.startswith('T1') and not f.startswith('T2') and not f.startswith('T3')]
     train_files = all_files[:int(0.8 * len(all_files))]
     val_files = all_files[int(0.8 * len(all_files)):]
     train_loader = DataLoader(WeldDataset(train_files), batch_size=config.BATCH_SIZE,

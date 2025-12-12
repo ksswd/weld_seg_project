@@ -14,8 +14,8 @@ from test.test import test_model
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Weld Segmentation Project")
-    parser.add_argument('--mode', type=str, required=True, choices=['preprocess', 'train', 'test'], 
-                        help="Mode to run: 'preprocess', 'train', or 'test'")
+    parser.add_argument('--mode', type=str, required=True, choices=['preprocess', 'train', 'test', 'pretrain', 'finetune'], 
+                        help="Mode to run: 'preprocess', 'train(pretrain + finetune)', 'test', 'pretrain', or 'finetune'")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
     print("Running with configuration:")
@@ -42,7 +42,17 @@ def main():
         run_pretrain(config)
         run_finetune(config)
         print("--- Training Complete ---")
-        
+    
+    elif args.mode == 'finetune':
+        print("--- Starting Fine-tuning ---")
+        run_finetune(config)
+        print("--- Fine-tuning Complete ---")
+    
+    elif args.mode == 'pretrain':
+        print("--- Starting Pre-training ---")
+        run_pretrain(config)
+        print("--- Pre-training Complete ---")
+    
     elif args.mode == 'test':
         print("--- Starting Inference ---")
         test_model(config)

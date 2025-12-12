@@ -6,6 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model.model import GeometryAwareTransformer
 from utils.metric_utils import calculate_metrics
 from utils.config import Config as GlobalConfig
+from utils.downsampling import fps
 
 class WeldDataset(Dataset):
     def __init__(self, file_list):
@@ -33,43 +34,75 @@ class WeldDataset(Dataset):
 
 def collate_fn(batch):
     global_max = getattr(GlobalConfig, 'MAX_POINTS', None)
+    # 取 batch 里的最大点数，但最终采样到 global_max
     max_pts = max(item['features'].shape[0] for item in batch)
-    max_pts = min(max_pts, global_max) if global_max else max_pts
-    def pad(arr_list, shape, pad_val=0.0):
-        out = np.full(shape, pad_val, dtype=np.float32)
-        for i, arr in enumerate(arr_list):
-            n = min(arr.shape[0], shape[1])
-            out[i, :n] = arr[:n]
-        return out
-    b, c = len(batch), batch[0]['features'].shape[1]
-    feats = pad([b['features'] for b in batch], (b, max_pts, c))
-    normals = pad([b['normals'] for b in batch], (b, max_pts, 3))
-    principal = pad([b['principal_dir'] for b in batch], (b, max_pts, 3))
-    curvature = pad([b['curvature'] for b in batch], (b, max_pts, 1))
-    density = pad([b['local_density'] for b in batch], (b, max_pts, 1))
-    linearity = pad([b['linearity'] for b in batch], (b, max_pts, 1))
-    labels = pad([b['labels'] for b in batch], (b, max_pts, 1), pad_val=-1.0)
-    mask = torch.zeros(b, max_pts, dtype=torch.bool)
-    for i, item in enumerate(batch):
-        mask[i, :item['features'].shape[0]] = 1
+    M = min(max_pts, global_max) if global_max else max_pts
+    # 准备列表
+    feats_list = []
+    normals_list = []
+    principal_list = []
+    curvature_list = []
+    density_list = []
+    linearity_list = []
+    labels_list = []
+    for item in batch:
+        # ---- 1) 把所有字段先放到 GPU ----
+        feats = torch.from_numpy(item['features']).cuda()
+        normals = torch.from_numpy(item['normals']).cuda()
+        principal = torch.from_numpy(item['principal_dir']).cuda()
+        curvature = torch.from_numpy(item['curvature']).cuda()
+        density = torch.from_numpy(item['local_density']).cuda()
+        linearity = torch.from_numpy(item['linearity']).cuda()
+        labels = torch.from_numpy(item['labels']).cuda()
+
+        # ---- 2) FPS（只用 xyz = feats[:, :3]）----
+        idx = fps(feats[:, :3], M)
+
+        # ---- 3) 同步采样所有 field ----
+        feats = feats[idx]
+        normals = normals[idx]
+        principal = principal[idx]
+        curvature = curvature[idx]
+        density = density[idx]
+        linearity = linearity[idx]
+        labels = labels[idx]
+
+        # ---- 4) 放入 batch 列表 ----
+        feats_list.append(feats)
+        normals_list.append(normals)
+        principal_list.append(principal)
+        curvature_list.append(curvature)
+        density_list.append(density)
+        linearity_list.append(linearity)
+        labels_list.append(labels)
+
+    # ---- 5) stack 成 final batch ----
+    feats     = torch.stack(feats_list, dim=0)
+    normals   = torch.stack(normals_list, dim=0)
+    principal = torch.stack(principal_list, dim=0)
+    curvature = torch.stack(curvature_list, dim=0)
+    density   = torch.stack(density_list, dim=0)
+    linearity = torch.stack(linearity_list, dim=0)
+    labels    = torch.stack(labels_list, dim=0)
+
     return {
-        'features': torch.from_numpy(feats),
-        'normals': torch.from_numpy(normals),
-        'principal_dir': torch.from_numpy(principal),
-        'curvature': torch.from_numpy(curvature),
-        'local_density': torch.from_numpy(density),
-        'linearity': torch.from_numpy(linearity),
-        'labels': torch.from_numpy(labels),
-        'mask': mask
+        "features": feats,
+        "normals": normals,
+        "principal_dir": principal,
+        "curvature": curvature,
+        "local_density": density,
+        "linearity": linearity,
+        "labels": labels,
     }
 
 def run_finetune(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labeled_files = [os.path.join(config.LABEL_DATA_DIR, f)
                      for f in os.listdir(config.LABEL_DATA_DIR)
-                     if f.endswith('.npz') and '_pred' not in f]
+                     if f.endswith('.npz') and '_pred' not in f and not f.startswith('T1') and not f.startswith('T2') and not f.startswith('T3')]
     train_files = labeled_files[:int(0.8 * len(labeled_files))]
     val_files = labeled_files[int(0.8 * len(labeled_files)):]
+    print(val_files)
     train_loader = DataLoader(WeldDataset(train_files), batch_size=config.BATCH_SIZE,
                               shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
     val_loader = DataLoader(WeldDataset(val_files), batch_size=config.BATCH_SIZE,
@@ -146,44 +179,16 @@ def run_finetune(config):
                 batch['local_density'], batch['normals'], batch['linearity'],
                 task='class'
             )  # (B,N,1)
-
-
             labels = batch['labels']          # (B,N,1)
-            labeled_mask = (labels >= 0)
-
-            if labeled_mask.any():
-
-                loss_per_point = criterion(logits.squeeze(-1), labels.squeeze(-1))  # (B,N)
-                mask2d = labeled_mask.squeeze(-1)
-
-                loss_sum_batch = loss_per_point[mask2d].sum()
-                n_labeled = int(mask2d.sum().item())
-
-                loss_for_backward = loss_sum_batch / max(1, n_labeled)
-
-                if labeled_mask.any():
-                    loss_per_point = criterion(logits.squeeze(-1), labels.squeeze(-1))  # (B,N)
-                    mask2d = labeled_mask.squeeze(-1)
-
-                    loss_sum_batch = loss_per_point[mask2d].sum()
-                    n_labeled = int(mask2d.sum().item())
-
-                    # ===== 曲率引导辅助 loss =====
-                    curv_norm = batch["curvature"].squeeze(-1) / (batch["curvature"].max() + 1e-6)
-                    pred_sigmoid = torch.sigmoid(logits.squeeze(-1))
-                    # 对高曲率点的错误预测增加 penalty
-                    loss_aux = ((1 - pred_sigmoid)**2 * curv_norm).mean() * 0.3  # 0.2~0.4 可调
-                    loss_for_backward = (loss_sum_batch / max(1, n_labeled)) + loss_aux
-
-                else:
-                    loss_for_backward = torch.tensor(0.0, device=device, requires_grad=True)
-                    loss_sum_batch = torch.tensor(0.0)
-                    n_labeled = 0
-
-            else:
-                loss_for_backward = torch.tensor(0.0, device=device, requires_grad=True)
-                loss_sum_batch = torch.tensor(0.0)
-                n_labeled = 0
+            loss_per_point = criterion(logits.squeeze(-1), labels.squeeze(-1))  # (B,N)
+            loss_sum_batch = loss_per_point.sum()
+            n_labeled = int(labels.numel())
+            # ===== 曲率引导辅助 loss =====
+            curv_norm = batch["curvature"].squeeze(-1) / (batch["curvature"].max() + 1e-6)
+            pred_sigmoid = torch.sigmoid(logits.squeeze(-1))
+            # 对高曲率点的错误预测增加 penalty
+            loss_aux = ((1 - pred_sigmoid)**2 * curv_norm).mean() * 0.3  # 0.2~0.4 可调
+            loss_for_backward = (loss_sum_batch / max(1, n_labeled)) + loss_aux
 
             loss_for_backward = loss_for_backward / accum_steps
             loss_for_backward.backward()
@@ -225,25 +230,17 @@ def validate(model, loader, device, criterion):
         logits = model(batch['features'], batch['principal_dir'], batch['curvature'],
                        batch['local_density'], batch['normals'], batch['linearity'], task='class')
         labels = batch['labels']
-        labeled_mask = (labels >= 0)
-        if labeled_mask.any():
-            loss_per_point = criterion(logits.squeeze(-1), labels.squeeze(-1))
-            labeled_mask2d = labeled_mask.squeeze(-1)
-            loss_sum_batch = loss_per_point[labeled_mask2d].sum().item()
-            n_labeled = int(labeled_mask2d.sum().item())
-        else:
-            loss_sum_batch = 0.0
-            n_labeled = 0
+        loss_per_point = criterion(logits.squeeze(-1), labels.squeeze(-1))
+        loss_sum_batch = loss_per_point.sum().item()
+        n_labeled = int(labels.numel())
 
         total_loss_sum += loss_sum_batch
         total_labeled_pts += n_labeled
 
         probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
         labs = labels.cpu().numpy().reshape(-1)
-        mask = labeled_mask.cpu().numpy().reshape(-1)
-        if mask.any():
-            all_preds.append(probs[mask])
-            all_labels.append(labs[mask])
+        all_preds.append(probs)
+        all_labels.append(labs)
 
     val_loss = (total_loss_sum / total_labeled_pts) if total_labeled_pts > 0 else 0.0
 

@@ -10,7 +10,6 @@
 # 打印当前主机名
 echo "Running on host: $(hostname)"
 
-module purge
 conda --version
 
 # 创建并激活虚拟环境
@@ -41,7 +40,7 @@ echo "Starting execution at $(date)"
 
 # python main.py --mode preprocess
 python main.py --mode train
-# python main.py --mode test
+# python main.py --mode finetune
 # python visualize.py
 # python scripts/plot_loss_from_log.py job.41541.out --out loss_plot.png --csv losses.csv
 

@@ -4,9 +4,9 @@ from dataclasses import dataclass
 class Config:
     # --- Data and Preprocessing ---
     LABEL_DATA_DIR = "data/processed/label"
-    RAW_DATA_DIR = "data/raw/new"
+    RAW_DATA_DIR = "data/raw/new/augmented_ply"
     PROCESSED_DATA_DIR = "data/processed/new"
-    TEST_DATA_DIR = "data/test/new"
+    TEST_DATA_DIR = LABEL_DATA_DIR
     PREDICTED_DATA_DIR = "data/predictions/new"
     SPLITS_DIR = "data/splits/new"
     K_NEIGHBORS = 20
@@ -78,4 +78,6 @@ class Config:
 
     CLASS_LOSS_WEIGHT = 1.0
 
+    REINIT_CLASSIFIER_ON_FINETUNE = True
+    
     PRETRAINED_WEIGHTS = "weights/best_pretrain.pth"
