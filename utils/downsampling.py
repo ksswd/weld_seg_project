@@ -1,48 +1,37 @@
-import torch
+import numpy as np
+import hashlib
+_FPS_CACHE = {}
+def _hash_points(points_np: np.ndarray):
+    """给点云生成 hash，用于缓存 key"""
+    return hashlib.sha256(points_np.tobytes()).hexdigest()
 
-@torch.no_grad()
-def fps(xyz: torch.Tensor, M: int):
+def fps_numpy(points: np.ndarray, k: int):
     """
-    xyz: (N, 3) float tensor on CUDA
-    M: number of samples
+    最远点采样（FPS）算法的 Numpy 实现
+    """
+    N = points.shape[0]
+    if k >= N:
+        return np.arange(N, dtype=np.int64)
+    dists = np.ones(N) * 1e10
+    idx = np.zeros(k, dtype=np.int64)
+    current = 0
+    for i in range(k):
+        idx[i] = current
+        dist = np.sum((points - points[current]) ** 2, axis=1)
+        dists = np.minimum(dists, dist)
+        current = np.argmax(dists)
+    return idx
 
-    return index: (M,) long tensor, selected indices
-    """
-    N = xyz.shape[0]
-    if M >= N:
-        return torch.arange(N, device=xyz.device)
-    centroids = torch.zeros(M, dtype=torch.long, device=xyz.device)  
-    distances = torch.full((N,), 1e10, device=xyz.device)  
-    farthest = torch.randint(0, N, (1,), device=xyz.device)
-    for i in range(M):
-        centroids[i] = farthest
-        centroid = xyz[farthest].view(1, 3)                  # (1,3)
-        dist = torch.sum((xyz - centroid)**2, dim=1)         # (N,)
-        distances = torch.minimum(distances, dist)
-        farthest = torch.argmax(distances)
-    return centroids
 
-@torch.no_grad()
-def sample_with_fps(item: dict, M: int):
+def fps_with_cache(points: np.ndarray, k: int):
     """
-    item: 一个数据样本的 dict，包含 features, normals, curvature 等字段
-    M: 采样后的点数
-
-    return: 新的 item dict（所有字段都同步采样）
+    带缓存的最远点采样（FPS）
     """
-    xyz = torch.from_numpy(item["features"][:, :3]).cuda()   # (N,3)
-    # Get FPS indices
-    idx = fps(xyz, M)    # (M,)
-    out = {}
-    for key, val in item.items():
-        if isinstance(val, (list, tuple)):
-            out[key] = val
-            continue
-        arr = torch.from_numpy(val) if not torch.is_tensor(val) else val
-        arr = arr.cuda()
-        if arr.ndim == 2:
-            # (N, C)
-            out[key] = arr[idx]
-        else:
-            out[key] = arr
-    return out
+    assert points.ndim == 2 and points.shape[1] == 3
+    key = (_hash_points(points), k)
+    if key in _FPS_CACHE:
+        idx_np = _FPS_CACHE[key]
+    else:
+        idx_np = fps_numpy(points, k)
+        _FPS_CACHE[key] = idx_np
+    return idx_np

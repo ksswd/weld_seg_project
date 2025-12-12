@@ -6,7 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model.model import GeometryAwareTransformer
 from train.mask_strategy import HighCurvatureMasker
 from utils.config import Config as GlobalConfig
-from utils.downsampling import fps
+from utils.downsampling import fps_with_cache as fps
 
 class WeldDataset(Dataset):
     def __init__(self, file_list):
@@ -29,10 +29,7 @@ class WeldDataset(Dataset):
         }
         
 def collate_fn(batch):
-    global_max = getattr(GlobalConfig, 'MAX_POINTS', None)
-    # 取 batch 里的最大点数，但最终采样到 global_max
-    max_pts = max(item['features'].shape[0] for item in batch)
-    M = min(max_pts, global_max) if global_max else max_pts
+    M = GlobalConfig.MAX_POINTS
     # 准备列表
     feats_list = []
     normals_list = []
@@ -41,26 +38,18 @@ def collate_fn(batch):
     density_list = []
     linearity_list = []
     for item in batch:
-        # ---- 1) 把所有字段先放到 GPU ----
-        feats = torch.from_numpy(item['features']).cuda()
-        normals = torch.from_numpy(item['normals']).cuda()
-        principal = torch.from_numpy(item['principal_dir']).cuda()
-        curvature = torch.from_numpy(item['curvature']).cuda()
-        density = torch.from_numpy(item['local_density']).cuda()
-        linearity = torch.from_numpy(item['linearity']).cuda()
+        # ---- 1) FPS（只用 xyz = feats[:, :3]）----
+        idx = fps(item['features'][:, :3], M)
 
-        # ---- 2) FPS（只用 xyz = feats[:, :3]）----
-        idx = fps(feats[:, :3], M)
+        # ---- 2) 同步采样所有 field ----
+        feats = item['features'][idx]
+        normals = item['normals'][idx]
+        principal = item['principal_dir'][idx]
+        curvature = item['curvature'][idx]
+        density = item['local_density'][idx]
+        linearity = item['linearity'][idx]
 
-        # ---- 3) 同步采样所有 field ----
-        feats = feats[idx]
-        normals = normals[idx]
-        principal = principal[idx]
-        curvature = curvature[idx]
-        density = density[idx]
-        linearity = linearity[idx]
-
-        # ---- 4) 放入 batch 列表 ----
+        # ---- 3) 放入 batch 列表 ----
         feats_list.append(feats)
         normals_list.append(normals)
         principal_list.append(principal)
@@ -68,21 +57,13 @@ def collate_fn(batch):
         density_list.append(density)
         linearity_list.append(linearity)
 
-    # ---- 5) stack 成 final batch ----
-    feats     = torch.stack(feats_list, dim=0)
-    normals   = torch.stack(normals_list, dim=0)
-    principal = torch.stack(principal_list, dim=0)
-    curvature = torch.stack(curvature_list, dim=0)
-    density   = torch.stack(density_list, dim=0)
-    linearity = torch.stack(linearity_list, dim=0)
-
     return {
-        "features": feats,
-        "normals": normals,
-        "principal_dir": principal,
-        "curvature": curvature,
-        "local_density": density,
-        "linearity": linearity,
+        "features": torch.from_numpy(np.stack(feats_list, axis=0)),
+        "normals": torch.from_numpy(np.stack(normals_list, axis=0)),
+        "principal_dir": torch.from_numpy(np.stack(principal_list, axis=0)),
+        "curvature": torch.from_numpy(np.stack(curvature_list, axis=0)),
+        "local_density": torch.from_numpy(np.stack(density_list, axis=0)),
+        "linearity": torch.from_numpy(np.stack(linearity_list, axis=0)),
     }
 
 def run_pretrain(config):
@@ -92,10 +73,11 @@ def run_pretrain(config):
                  if f.endswith('.npz') and '_pred' not in f and not f.startswith('T1') and not f.startswith('T2') and not f.startswith('T3')]
     train_files = all_files[:int(0.8 * len(all_files))]
     val_files = all_files[int(0.8 * len(all_files)):]
+    # num_workers 设置为默认值 0 以避免多进程下_FPS_CACHE不共享的问题
     train_loader = DataLoader(WeldDataset(train_files), batch_size=config.BATCH_SIZE,
-                              shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+                              shuffle=True, collate_fn=collate_fn, pin_memory=True)
     val_loader = DataLoader(WeldDataset(val_files), batch_size=config.BATCH_SIZE,
-                            shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+                            shuffle=False, collate_fn=collate_fn, pin_memory=True)
 
     model = GeometryAwareTransformer(config).to(device)
     masker = HighCurvatureMasker(mask_ratio=config.MASK_RATIO)
