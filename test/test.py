@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from model.model import GeometryAwareTransformer
 from utils.io_utils import save_features_to_npz
+from utils.downsampling import fps_with_cache as fps
 
 def test_model(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -12,7 +13,7 @@ def test_model(config):
                   for f in os.listdir(config.TEST_DATA_DIR)
                   if f.endswith('.npz') and not f.startswith('T1') and not f.startswith('T2') and not f.startswith('T3')]
 
-    max_points = getattr(config, 'MAX_POINTS', None)
+    max_points = getattr(config, 'MAX_POINTS', 4096)
 
     model = GeometryAwareTransformer(config).to(device)
     model_path = "weights/best_finetune.pth"
@@ -27,71 +28,52 @@ def test_model(config):
         data = np.load(file_path)
         features = data['features'].astype(np.float32)
         points = features[..., :3]
-        curvature_np = data['curvature'].astype(np.float32)  # [N,1]
+        curv_np = data['curvature'].astype(np.float32)  # [N,1]
+        pd_np = data['principal_dir'].astype(np.float32)  # [N,3]
+        den_np = data['local_density'].astype(np.float32)            # [N,1]
+        nor_np = data['normals'].astype(np.float32)            # [N,3]
+        lin_np = data['linearity'].astype(np.float32)          # [N,1]
+        
         N = features.shape[0]
+        idxs = fps(points, max_points)
+        features = features[idxs]
+        points = points[idxs]
+        curv_np = curv_np[idxs]
+        den_np = den_np[idxs]
+        nor_np = nor_np[idxs]
+        lin_np = lin_np[idxs]
+        pd_np = pd_np[idxs]
+        
+        
+        preds_binary = np.zeros((min(N, max_points), 1), dtype=np.float32)
+        
+        f = torch.from_numpy(features[np.newaxis, ...]).to(device)
+        pd = torch.from_numpy(pd_np[np.newaxis, ...]).to(device)
+        curv = torch.from_numpy(curv_np[np.newaxis, ...]).to(device)  # [1,M,1]
+        den = torch.from_numpy(den_np[np.newaxis, ...]).to(device)
+        nor = torch.from_numpy(nor_np[np.newaxis, ...]).to(device)
+        lin = torch.from_numpy(lin_np[np.newaxis, ...]).to(device)
 
-        preds_binary = np.zeros((N, 1), dtype=np.float32)
+        with torch.no_grad():
+            logits = model(f, pd, curv, den, nor, lin, task='class').squeeze(0).squeeze(-1)
 
-        def run_chunk(feats, pd_np, curv_np, den_np, nor_np, lin_np, out_slice):
-            """内部小函数：支持完整 GPU + 曲率归一化 + 安全 try"""
-            f = torch.from_numpy(feats[None]).to(device)
-            pd = torch.from_numpy(pd_np[None]).to(device)
-            curv = torch.from_numpy(curv_np[None]).to(device)  # [1,M,1]
-            den = torch.from_numpy(den_np[None]).to(device)
-            nor = torch.from_numpy(nor_np[None]).to(device)
-            lin = torch.from_numpy(lin_np[None]).to(device)
+            # ---- 曲率归一化 ----
+            curv_vec = curv.squeeze(0).squeeze(-1)  # [M]
+            cmin = torch.min(curv_vec)
+            cmax = torch.max(curv_vec)
+            curv_norm = (curv_vec - cmin) / (cmax - cmin + 1e-8)
 
-            with torch.no_grad():
-                try:
-                    logits = model(f, pd, curv, den, nor, lin, task='class').squeeze(0).squeeze(-1)
+            # ---- logits 加权 ----
+            logits_adj = logits + alpha * curv_norm
 
-                    # ---- 曲率归一化 ----
-                    curv_vec = curv.squeeze(0).squeeze(-1)  # [M]
-                    cmin = torch.min(curv_vec)
-                    cmax = torch.max(curv_vec)
-                    curv_norm = (curv_vec - cmin) / (cmax - cmin + 1e-8)
+            # ---- sigmoid ----
+            probs = torch.sigmoid(logits_adj)
 
-                    # ---- logits 加权 ----
-                    logits_adj = logits + alpha * curv_norm
+            # ---- 低曲率过滤 ----
+            probs[curv_vec < curv_gate] = 0.0
 
-                    # ---- sigmoid ----
-                    probs = torch.sigmoid(logits_adj)
-
-                    # ---- 低曲率过滤 ----
-                    probs[curv_vec < curv_gate] = 0.0
-
-                    # ---- 最终阈值 ----
-                    out = (probs > thresh).float().cpu().numpy()[:, None]
-                    preds_binary[out_slice] = out
-
-                except Exception as e:
-                    print("Chunk failed:", e)
-                    preds_binary[out_slice] = 0.0
-
-        # === No chunk ===
-        if max_points is None or N <= max_points:
-            run_chunk(
-                features,
-                data['principal_dir'].astype(np.float32),
-                curvature_np,
-                data['local_density'].astype(np.float32),
-                data['normals'].astype(np.float32),
-                data['linearity'].astype(np.float32),
-                slice(0, N),
-            )
-        else:
-            num_chunks = (N + max_points - 1) // max_points
-            for c in range(num_chunks):
-                s, e = c * max_points, min(N, (c + 1) * max_points)
-                run_chunk(
-                    features[s:e],
-                    data['principal_dir'][s:e].astype(np.float32),
-                    curvature_np[s:e],
-                    data['local_density'][s:e].astype(np.float32),
-                    data['normals'][s:e].astype(np.float32),
-                    data['linearity'][s:e].astype(np.float32),
-                    slice(s, e),
-                )
+            # ---- 最终阈值 ----
+            preds_binary = (probs > thresh).float().cpu().numpy()[:, None]
 
         # 保存
         save_path = os.path.join(
