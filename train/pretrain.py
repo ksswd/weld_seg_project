@@ -18,45 +18,38 @@ class WeldDataset(Dataset):
         feat = data['features'].astype(np.float32)
         if feat.ndim == 1:
             feat = feat[None, :]
-        normals = data['normals'].astype(np.float32) if 'normals' in data else feat[:, 3:6]
-        curvature = data['curvature'].astype(np.float32) if 'curvature' in data else feat[:, 6:7]
-        local_density = data['local_density'].astype(np.float32) if 'local_density' in data else feat[:, 7:8]
-        principal_dir = data['principal_dir'].astype(np.float32) if 'principal_dir' in data else np.zeros_like(normals)
-        linearity = data['linearity'].astype(np.float32) if 'linearity' in data else np.zeros((feat.shape[0], 1), dtype=np.float32)
+        normals = data['normals'].astype(np.float32) #if 'normals' in data else feat[:, 3:6]
+        curvature = data['curvature'].astype(np.float32) #if 'curvature' in data else feat[:, 6:7]
+        local_density = data['local_density'].astype(np.float32) #if 'local_density' in data else feat[:, 7:8]
+        principal_dir = data['principal_dir'].astype(np.float32) #if 'principal_dir' in data else np.zeros_like(normals)
+        linearity = data['linearity'].astype(np.float32) #if 'linearity' in data else np.zeros((feat.shape[0], 1), dtype=np.float32)
         return {
             'features': feat, 'normals': normals, 'curvature': curvature,
             'local_density': local_density, 'principal_dir': principal_dir, 'linearity': linearity
         }
         
 def collate_fn(batch):
-    M = GlobalConfig.MAX_POINTS
-    # 准备列表
-    feats_list = []
-    normals_list = []
-    principal_list = []
-    curvature_list = []
-    density_list = []
-    linearity_list = []
-    for item in batch:
-        # ---- 1) FPS（只用 xyz = feats[:, :3]）----
-        idx = fps(item['features'][:, :3], M)
-
-        # ---- 2) 同步采样所有 field ----
-        feats = item['features'][idx]
-        normals = item['normals'][idx]
-        principal = item['principal_dir'][idx]
-        curvature = item['curvature'][idx]
-        density = item['local_density'][idx]
-        linearity = item['linearity'][idx]
-
-        # ---- 3) 放入 batch 列表 ----
-        feats_list.append(feats)
-        normals_list.append(normals)
-        principal_list.append(principal)
-        curvature_list.append(curvature)
-        density_list.append(density)
-        linearity_list.append(linearity)
-
+    ## Limites the number of points per batch item to avoid OOM
+    global_max = getattr(GlobalConfig, 'MAX_POINTS', None)
+    max_pts = max(item['features'].shape[0] for item in batch)
+    max_pts = min(max_pts, global_max) if global_max else max_pts
+    
+    def pad(arr_list, shape):
+        out = np.full(shape, 0.0, dtype=np.float32)
+        for i, arr in enumerate(arr_list):
+            n = min(arr.shape[0], shape[1])
+            out[i, :n] = arr[:n]
+        return out
+    b, c = len(batch), batch[0]['features'].shape[1]
+    feats = pad([b['features'] for b in batch], (b, max_pts, c))
+    normals = pad([b['normals'] for b in batch], (b, max_pts, 3))
+    principal = pad([b['principal_dir'] for b in batch], (b, max_pts, 3))
+    curvature = pad([b['curvature'] for b in batch], (b, max_pts, 1))
+    density = pad([b['local_density'] for b in batch], (b, max_pts, 1))
+    linearity = pad([b['linearity'] for b in batch], (b, max_pts, 1))
+    mask = torch.zeros(b, max_pts, dtype=torch.bool)
+    for i, item in enumerate(batch):
+        mask[i, :item['features'].shape[0]] = 1
     return {
         "features": torch.from_numpy(np.stack(feats_list, axis=0)),
         "normals": torch.from_numpy(np.stack(normals_list, axis=0)),
@@ -88,6 +81,9 @@ def run_pretrain(config):
     writer = SummaryWriter(os.path.join(getattr(config, 'LOG_DIR', 'logs'), 'pretrain'))
     best_loss = float('inf')
     os.makedirs(config.WEIGHTS_SAVE_DIR, exist_ok=True)
+
+    # 设置最后一次训练，把掩码和重建的结果输出保存下来供后续分析
+    save_last_epoch_outputs = True
 
     for epoch in range(config.NUM_EPOCHS):
         model.train()
@@ -156,6 +152,28 @@ def run_pretrain(config):
             best_loss = val_loss
             torch.save(model.state_dict(), os.path.join(config.WEIGHTS_SAVE_DIR, "best_pretrain.pth"))
             print("Saved best_pretrain.pth")
+
+        if save_last_epoch_outputs and epoch == config.NUM_EPOCHS - 1:
+            # 保存最后一个 epoch 的掩码和重建结果
+            output_dir = os.path.join(config.WEIGHTS_SAVE_DIR, "last_epoch_outputs")
+            os.makedirs(output_dir, exist_ok=True)
+            model.eval()
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(val_loader, desc="Saving last epoch outputs")):
+                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                    mask = masker.generate_mask(batch['curvature']).squeeze(-1).bool()
+                    masked_feat = batch['features'].clone()
+                    mask_xyz = mask.unsqueeze(-1).expand_as(masked_feat[..., :3])
+                    masked_feat[..., :3][mask_xyz] = 0.0
+                    recon = model(masked_feat, batch['principal_dir'], batch['curvature'],
+                                  batch['local_density'], batch['normals'], batch['linearity'], task='recon')
+                    for j in range(batch['features'].size(0)):
+                        np.savez(os.path.join(output_dir, f"sample_{i * config.BATCH_SIZE + j}_masked.npz"),
+                                 features=masked_feat[j].cpu().numpy())
+                        np.savez(os.path.join(output_dir, f"sample_{i * config.BATCH_SIZE + j}_recon.npz"),
+                                 features=recon[j].cpu().numpy())
+            print(f"Saved last epoch outputs to {output_dir}")
+
         scheduler.step()
 
 def recon_criterion(criterion, recon, batch, mask, gt_coords_flat=None):

@@ -12,6 +12,10 @@ def calculate_metrics(predictions, labels):
     # 确保输入是一维数组
     predictions = predictions.flatten()
     labels = labels.flatten()
+    # print(labels)
+    # unique, counts = np.unique(labels, return_counts=True)
+    # label_counts = dict(zip(unique, counts))
+    # print(label_counts)
 
     # 计算准确率 (Accuracy)
     acc = accuracy_score(labels, predictions)

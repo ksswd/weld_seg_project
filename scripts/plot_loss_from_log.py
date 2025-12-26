@@ -15,7 +15,9 @@ import csv
 import matplotlib.pyplot as plt
 
 
-LOSS_LINE_RE = re.compile(r"Epoch\s+(\d+),\s*Train Loss:\s*([0-9.eE+-]+),\s*Val Loss:\s*([0-9.eE+-]+)")
+LOSS_LINE_RE = re.compile(
+    r"Epoch\s+(\d+)\s+\|\s+Train Loss:\s+([\d.]+)\s*,\s*Val Loss:\s+([\d.]+)\s*,\s*F1:\s+([\d.]+)\s*,\s*Best Threshold:\s+([\d.]+)"
+)
 
 
 def parse_log(path):
@@ -62,8 +64,8 @@ def plot_and_save(epochs, train, val, out_png: Path, show=False):
 
 def main():
     p = argparse.ArgumentParser(description='Plot Train/Val loss from a training log file')
-    p.add_argument('logfile', type=Path, help='Path to the training log file')
-    p.add_argument('--out', type=Path, default=Path('loss_plot.png'), help='Output PNG path')
+    p.add_argument('logfile', type=Path, default='train_log.txt', help='Path to the training log file' )
+    p.add_argument('--out', type=Path, default=Path('loss_plot_ft.png'), help='Output PNG path')
     p.add_argument('--csv', type=Path, default=None, help='Optional CSV output path')
     p.add_argument('--show', action='store_true', help='Show the plot interactively')
     args = p.parse_args()

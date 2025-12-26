@@ -44,4 +44,5 @@ python main.py --mode train
 # python visualize.py
 # python scripts/plot_loss_from_log.py job.41541.out --out loss_plot.png --csv losses.csv
 
-echo "Finished execution at $(date)"
+python main.py --mode train > train_log.txt 2>&1
+python main.py --mode test > test_log.txt 2>&1

@@ -22,7 +22,7 @@ def test_model(config):
 
     alpha = getattr(config, 'CURVATURE_WEIGHT_ALPHA', 0.3)  # 建议 0.2~0.5
     thresh = getattr(config, 'PREDICTION_THRESHOLD', 0.5)
-    curv_gate = getattr(config, 'CURVATURE_GATE', 0.0008)     # 低曲率直接过滤掉
+    curv_gate = getattr(config, 'CURVATURE_GATE', 0)     # 低曲率直接过滤掉
 
     for file_path in test_files:
         data = np.load(file_path)

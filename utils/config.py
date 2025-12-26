@@ -7,6 +7,7 @@ class Config:
     RAW_DATA_DIR = "data/raw/new/augmented_ply"
     PROCESSED_DATA_DIR = "data/processed/new"
     TEST_DATA_DIR = LABEL_DATA_DIR
+    TEST_DATA_DIR = "data/test/new"  # Using correctly normalized training samples
     PREDICTED_DATA_DIR = "data/predictions/new"
     SPLITS_DIR = "data/splits/new"
     K_NEIGHBORS = 20
@@ -20,7 +21,7 @@ class Config:
     # Internal model feature dimension. Must be divisible by N_HEADS.
     D_MODEL = 12  # increased so it's divisible by 3 when using 3 heads
     N_HEADS = 3  # T-head, N-head, C-head
-    N_LAYERS = 1 # Geometry -> Local -> Geometry -> Global
+    N_LAYERS = 3 # Geometry -> Local -> Geometry -> Global
     FFN_DIM = 64 # Feed-forward network dimension in Transformer block
 
     # --- Attention Parameters ---
@@ -32,13 +33,19 @@ class Config:
 
     # --- Training ---
     BATCH_SIZE = 4
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-4  # for pretraining
+    FINETUNE_LR = 1e-4    # learning rate for finetuning (increased from 5e-5 for faster convergence)
     WEIGHT_DECAY = 1e-5
-    NUM_EPOCHS = 300
+    NUM_EPOCHS = 150  # increased for better convergence
     MASK_RATIO = 0.1 # fraction of points to mask per-sample
     CURVATURE_THRESHOLD = 0.0008 # for pseudo-labeling
     # Number of DataLoader worker processes. Use 0 on Windows for stability/debug.
     NUM_WORKERS = 0
+
+    # Focal Loss parameters
+    USE_FOCAL_LOSS = True      # Use Focal Loss instead of BCE (better for extreme imbalance)
+    FOCAL_GAMMA = 2.0          # Focusing parameter (2.0 is standard)
+    FREEZE_BACKBONE = False    # UNFREEZE backbone for this short finetune run
 
     # Maximum points to keep per sample (for downsampling to control attention memory).
     # NOTE: the training code must implement sampling from this value to take effect.
@@ -56,6 +63,15 @@ class Config:
 
     # --- Inference ---
     PREDICTION_THRESHOLD = 0.50 # threshold for binary classification from sigmoid output
+
+    # --- Finetune balancing & emphasis (temporary experimental settings) ---
+    NEG_TO_POS_RATIO = 2       # target negatives per positive during downsampling
+    MAX_NEG_PER_SAMPLE = 2000  # cap negatives per sample
+    EMPHASIS_FACTOR = 3.0      # increase loss weight for emphasized files (e.g., halfv/lap)
+    EMPHASIS_KEYS = ['halfv', 'half_v', 'lap']
+    CURV_GAIN = 4.0            # curvature channel gain applied during finetune
+    FINETUNE_LR = 5e-5         # smaller lr when unfreezing backbone
+    # NUM_EPOCHS = 2             # short run for experiment
 
     # --- Paths ---
     WEIGHTS_SAVE_DIR = "weights"
@@ -81,3 +97,5 @@ class Config:
     REINIT_CLASSIFIER_ON_FINETUNE = True
     
     PRETRAINED_WEIGHTS = "weights/best_pretrain.pth"
+
+    TEST_WEIGHTS = "weights/best_finetune.pth"

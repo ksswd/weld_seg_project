@@ -5,3 +5,12 @@ logs/**
 chosen.zip
 label_process.zip
 **.out
+*.npz
+weights/saved/best_finetune.pth
+CLAUDE.md
+FINETUNE_FIX_SUMMARY.md
+INFERENCE_FIX.md
+SOLUTION_B_FOCAL.md
+train_log.txt
+weights/best_finetune.meta.json
+weights/saved/best_pretrain.pth

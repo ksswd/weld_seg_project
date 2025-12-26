@@ -42,17 +42,37 @@ class PointCloudPreprocessor:
         """使用训练数据计算归一化参数"""
         print("Fitting preprocessor...")
         point_clouds, _ = read_all_ply_from_dir(dataset_dir)
-        
+
         all_features = []
         for pc in point_clouds:
             features, _ = self._compute_raw_features(pc)
             all_features.append(features)
-            
+
         all_features = np.vstack(all_features)
         self.mu = np.mean(all_features, axis=0)
         self.sigma = np.std(all_features, axis=0)
         self.sigma[self.sigma == 0] = 1.0
         print("Preprocessor fitted.")
+        print(f"  mu: {self.mu}")
+        print(f"  sigma: {self.sigma}")
+
+    def save_params(self, save_path="normalization_params.npz"):
+        """保存归一化参数"""
+        if self.mu is None or self.sigma is None:
+            raise RuntimeError("Preprocessor has not been fitted. Call 'fit' first.")
+        np.savez(save_path, mu=self.mu, sigma=self.sigma)
+        print(f"Saved normalization parameters to: {save_path}")
+
+    def load_params(self, load_path="normalization_params.npz"):
+        """加载归一化参数"""
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"Normalization params not found: {load_path}")
+        params = np.load(load_path)
+        self.mu = params['mu']
+        self.sigma = params['sigma']
+        print(f"Loaded normalization parameters from: {load_path}")
+        print(f"  mu: {self.mu}")
+        print(f"  sigma: {self.sigma}")
 
     def transform(self, point_cloud_np):
         """对单个点云计算并归一化特征"""
