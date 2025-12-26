@@ -2,7 +2,7 @@
 import os
 import numpy as np
 from .geometric_feature import GeometricFeatureCalculator
-from utils.io_utils import read_all_ply_from_dir, save_features_to_npz
+from utils.io_utils import read_all_ply_from_dir
 
 class PointCloudPreprocessor:
     def __init__(self, config):
@@ -71,16 +71,17 @@ class PointCloudPreprocessor:
         for pc, file_path in zip(point_clouds, file_paths):
             try:
                 features, extra_info = self.transform(pc)
-                base_name = os.path.basename(file_path).replace('.ply', '.npz')
+                base_name = os.path.basename(file_path).replace('.ply', '.csv')
                 save_path = os.path.join(output_dir, base_name)
-                
-                # 保存特征和额外信息
-                data_to_save = {'features': features}
-                # extra_info now contains 'normals' and 'local_density' as well as curvature/linearity/principal_dir
-                data_to_save.update(extra_info)
-                # print(data_to_save['local_density'])
-                np.savez_compressed(save_path, **data_to_save)
-                
+                # 构建DataFrame，列名清晰
+                import pandas as pd
+                df = pd.DataFrame(features, columns=['x','y','z','nx','ny','nz','curvature','density'])
+                # 添加额外信息
+                df['linearity'] = extra_info['linearity'].flatten()
+                df['principal_dir_x'] = extra_info['principal_dir'][:, 0]
+                df['principal_dir_y'] = extra_info['principal_dir'][:, 1]
+                df['principal_dir_z'] = extra_info['principal_dir'][:, 2]
+                df.to_csv(save_path, index=False, float_format='%.6f')  
                 print(f"Processed and saved: {save_path}")
             except Exception as e:
                 print(f"Failed to process {file_path}: {e}")

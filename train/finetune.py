@@ -1,5 +1,6 @@
 # finetune.py
 import os, torch, numpy as np, torch.nn as nn
+import pandas as pd
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -8,23 +9,42 @@ from utils.metric_utils import calculate_metrics
 from utils.config import Config as GlobalConfig
 
 class WeldDataset(Dataset):
+    """从CSV文件加载带标签的点云数据"""
     def __init__(self, file_list):
         self.file_list = file_list
+
     def __len__(self):
         return len(self.file_list)
+
     def __getitem__(self, idx):
-        data = np.load(self.file_list[idx])
-        feat = data['features'].astype(np.float32)
-        if feat.ndim == 1:
-            feat = feat[None, :]
-        normals = data['normals'].astype(np.float32) if 'normals' in data else feat[:, 3:6]
-        curvature = data['curvature'].astype(np.float32) if 'curvature' in data else feat[:, 6:7]
-        local_density = data['local_density'].astype(np.float32) if 'local_density' in data else feat[:, 7:8]
-        principal_dir = data['principal_dir'].astype(np.float32) if 'principal_dir' in data else np.zeros_like(normals)
-        linearity = data['linearity'].astype(np.float32) if 'linearity' in data else np.zeros((feat.shape[0], 1), dtype=np.float32)
-        labels = data['labels'].astype(np.float32) if 'labels' in data else -1.0 * np.ones((feat.shape[0], 1), dtype=np.float32)
-        if labels.ndim == 1:
-            labels = labels[:, None]
+        # 读取CSV文件
+        df = pd.read_csv(self.file_list[idx])
+
+        # 提取8维特征: [x, y, z, nx, ny, nz, curvature, density]
+        feat = df[['x', 'y', 'z', 'nx', 'ny', 'nz', 'curvature', 'density']].values.astype(np.float32)
+
+        # 提取各个几何特征
+        normals = df[['nx', 'ny', 'nz']].values.astype(np.float32)
+        curvature = df[['curvature']].values.astype(np.float32)
+        local_density = df[['density']].values.astype(np.float32)
+
+        # 主方向和线性度
+        if 'principal_dir_x' in df.columns:
+            principal_dir = df[['principal_dir_x', 'principal_dir_y', 'principal_dir_z']].values.astype(np.float32)
+        else:
+            principal_dir = np.zeros_like(normals)
+
+        if 'linearity' in df.columns:
+            linearity = df[['linearity']].values.astype(np.float32)
+        else:
+            linearity = np.zeros((feat.shape[0], 1), dtype=np.float32)
+
+        # 标签 (finetune需要)
+        if 'label' in df.columns:
+            labels = df[['label']].values.astype(np.float32)
+        else:
+            labels = -1.0 * np.ones((feat.shape[0], 1), dtype=np.float32)
+
         return {
             'features': feat, 'normals': normals, 'curvature': curvature,
             'local_density': local_density, 'principal_dir': principal_dir,
@@ -67,7 +87,7 @@ def run_finetune(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labeled_files = [os.path.join(config.LABEL_DATA_DIR, f)
                      for f in os.listdir(config.LABEL_DATA_DIR)
-                     if f.endswith('.npz') and '_pred' not in f]
+                     if f.endswith('.csv') and '_pred' not in f]
     train_files = labeled_files[:int(0.8 * len(labeled_files))]
     val_files = labeled_files[int(0.8 * len(labeled_files)):]
     train_loader = DataLoader(WeldDataset(train_files), batch_size=config.BATCH_SIZE,
@@ -102,10 +122,12 @@ def run_finetune(config):
     if getattr(config, 'AUTO_POS_WEIGHT', True):
         pos, neg = 0, 0
         for p in labeled_files:
-            labs = np.load(p)['labels'].reshape(-1)
-            valid = labs >= 0
-            pos += int(((labs == 1) & valid).sum())
-            neg += int(((labs == 0) & valid).sum())
+            df = pd.read_csv(p)
+            if 'label' in df.columns:
+                labs = df['label'].values.reshape(-1)
+                valid = labs >= 0
+                pos += int(((labs == 1) & valid).sum())
+                neg += int(((labs == 0) & valid).sum())
         if pos > 0:
             # clamp to avoid extremely large weights
             raw = float(neg) / (float(pos) + 1e-8)
