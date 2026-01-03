@@ -1,1 +1,15 @@
 data/
+**/__pycache__/**
+*.ply
+logs/
+*.zip
+*.out
+*.npz
+weights/
+*.md
+*.txt
+*.csv
+*.png
+data_pre/
+*.npz
+data_pre/
