@@ -1,18 +1,31 @@
 # weld_seg_project/main.py
+import torch
+import argparse
+import sys
+import random
+import numpy as np
 from utils.config import Config
 from preprocess.preprocess import PointCloudPreprocessor
-from train.train import train_model
 from train.pretrain import run_pretrain
 from train.finetune import run_finetune
 from test.test import test_model
-import argparse
+
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Weld Segmentation Project")
-    parser.add_argument('--mode', type=str, required=True, choices=['preprocess', 'train', 'test'], 
-                        help="Mode to run: 'preprocess', 'train', or 'test'")
+    parser.add_argument('--mode', type=str, required=True, choices=['preprocess', 'train', 'test', 'pretrain', 'finetune'], 
+                        help="Mode to run: 'preprocess', 'train(pretrain + finetune)', 'test', 'pretrain', or 'finetune'")
+    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
-    
+    print("Running with configuration:")
+    for k, v in vars(args).items():
+        print(f"{k}: {v}")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     config = Config()
     
     if args.mode == 'preprocess':
@@ -20,6 +33,8 @@ def main():
         preprocessor = PointCloudPreprocessor(config)
         # Fit on training data
         preprocessor.fit(config.RAW_DATA_DIR)
+        # Save normalization params for inference
+        # preprocessor.save_params("normalization_params.npz")
         # Process and save the entire dataset (train/val/test combined here)
         preprocessor.process_and_save_dataset(config.RAW_DATA_DIR, config.PROCESSED_DATA_DIR)
         print("--- Preprocessing Complete ---")
@@ -29,7 +44,17 @@ def main():
         run_pretrain(config)
         run_finetune(config)
         print("--- Training Complete ---")
-        
+    
+    elif args.mode == 'finetune':
+        print("--- Starting Fine-tuning ---")
+        run_finetune(config)
+        print("--- Fine-tuning Complete ---")
+    
+    elif args.mode == 'pretrain':
+        print("--- Starting Pre-training ---")
+        run_pretrain(config)
+        print("--- Pre-training Complete ---")
+    
     elif args.mode == 'test':
         print("--- Starting Inference ---")
         test_model(config)
