@@ -1,5 +1,4 @@
 # weld_seg_project/model/model.py 主模型定义
-import torch
 import torch.nn as nn
 from .attention.multi_head import MultiHeadGeometryAttention
 from .attention.global_attention import GlobalAttention
@@ -42,14 +41,22 @@ class GeometryAwareTransformer(nn.Module):
 
         # Reconstruction head: map model features back to input feature dimension
         # Used for self-supervised reconstruction tasks (predict masked features)
-        self.recon_head = nn.Linear(config.D_MODEL, config.INPUT_DIM)
+        # Enhanced with MLP structure for better capacity (similar to classifier)
+        self.recon_head = nn.Sequential(
+            nn.Linear(config.D_MODEL, config.D_MODEL * 2),
+            nn.ReLU(),
+            nn.Linear(config.D_MODEL * 2, config.D_MODEL),
+            nn.ReLU(),
+            nn.Linear(config.D_MODEL, 3)
+        )
 
-    def forward(self, features, principal_dir, curvature, density, normals, linearity, task='class'):
+    def forward(self,  features,  coordinate, principal_dir, curvature, density, normals, linearity, task='class'):
         # project input features to model dimension
         x = self.input_proj(features)
         for block in self.attention_layers:
             x = block(
                 x,
+                coordinate=coordinate,
                 principal_dir=principal_dir,
                 curvature=curvature,
                 density=density,

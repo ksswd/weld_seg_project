@@ -34,10 +34,10 @@ class LocalAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x, principal_dir=None, curvature=None, density=None, normals=None, linearity=None):
+    def forward(self, x, coordinate=None, principal_dir=None, curvature=None, density=None, normals=None, linearity=None):
         """
         Args:
-            x: (B, N, C) 输入特征，前3维假设为xyz坐标
+            x: (B, N, C) 输入特征
             其他参数保留接口兼容性，但本模块不使用
 
         Returns:
@@ -47,7 +47,7 @@ class LocalAttention(nn.Module):
         k = min(self.k_neighbors, N)  # 确保k不超过点数
 
         # 提取xyz坐标用于计算距离
-        xyz = x[..., :3]  # (B, N, 3)
+        xyz = coordinate  # (B, N, 3)
 
         # 计算k-NN索引
         knn_idx = self._knn(xyz, k)  # (B, N, k)

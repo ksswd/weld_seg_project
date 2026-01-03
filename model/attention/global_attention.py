@@ -33,7 +33,7 @@ class GlobalAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x, principal_dir=None, curvature=None, density=None, normals=None, linearity=None):
+    def forward(self, x, coordinate=None, principal_dir=None, curvature=None, density=None, normals=None, linearity=None):
         """
         Args:
             x: (B, N, C) 输入特征

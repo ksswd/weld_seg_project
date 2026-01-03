@@ -1,5 +1,7 @@
 # weld_seg_project/model/transformer_block.py Transformer块
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, self_attn, ffn_dim):

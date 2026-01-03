@@ -1,10 +1,10 @@
 # weld_seg_project/model/attention/multi_head.py 多头几何注意力机制
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .anisotropic_dist import AnisotropicDistance
 from .geom_bias import GeometryAttentionBias
-from .side_gate import SideGating
+from .side_gate_priori import SideGating as SideGatingPriori
+from .side_gate_qwen import SideGating as SideGatingQwen
 
 class MultiHeadGeometryAttention(nn.Module):
     def __init__(self, d_model, n_heads, config):
@@ -22,9 +22,16 @@ class MultiHeadGeometryAttention(nn.Module):
 
         self.aniso_dist = AnisotropicDistance(alpha0=config.ALPHA0, beta0=config.BETA0)
         self.geom_bias = GeometryAttentionBias(gamma=config.GAMMA, sigma=config.SIGMA)
-        self.side_gate = SideGating(weld_width_range=config.WELD_WIDTH_RANGE)
+        self.side_gate_type = config.SIDE_GATE_TYPE
+        if self.side_gate_type == 'priori':
+            self.side_gate = SideGatingPriori(weld_width_range=config.WELD_WIDTH_RANGE)
+        elif self.side_gate_type == 'qwen':
+            self.side_gate = SideGatingQwen(input_dim=d_model, output_dim=d_model)
+        else:
+            raise ValueError(f"Unsupported SIDE_GATE_TYPE: {config.SIDE_GATE_TYPE}. "
+                             "Choose 'priori' or 'qwen'.")
 
-    def forward(self, x, principal_dir, curvature, density, normals, linearity):
+    def forward(self, x, coordinate, principal_dir, curvature, density, normals, linearity):
         B, N, C = x.shape
 
         qkv = self.qkv_proj(x)
@@ -47,14 +54,21 @@ class MultiHeadGeometryAttention(nn.Module):
         # attn_score shape: (B, n_heads, N, N)
         attn_score = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
-        aniso_dist = self.aniso_dist(x[..., :3], principal_dir, linearity)
+        aniso_dist = self.aniso_dist(coordinate, principal_dir, linearity)
         geom_bias = self.geom_bias(curvature, density, normals, linearity, aniso_dist)
-        side_gate = self.side_gate(x[..., :3], principal_dir, normals, density)
-
+        
         # Apply bias and gate
-        attn_score = attn_score + geom_bias.unsqueeze(1)
-        attn_score = attn_score * side_gate.unsqueeze(1)
-        attn_weight = F.softmax(attn_score, dim=-1)
-        attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
+        if self.side_gate_type == 'priori':
+            side_gate = self.side_gate(coordinate, principal_dir, normals, density)
+            attn_score = attn_score + geom_bias.unsqueeze(1)
+            attn_score = attn_score * side_gate.unsqueeze(1)
+            attn_weight = F.softmax(attn_score, dim=-1)
+            attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
+        elif self.side_gate_type == 'qwen':
+            side_gate = self.side_gate(x)
+            attn_score = attn_score + geom_bias.unsqueeze(1)
+            attn_weight = F.softmax(attn_score, dim=-1)
+            attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
+            attn_output = attn_output * side_gate
 
         return self.out_proj(attn_output)

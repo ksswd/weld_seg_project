@@ -11,7 +11,6 @@ class SideGating(nn.Module):
         self.a3 = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, points, principal_dir, normals, density):
-        B, N, _ = points.shape
         point_diff = points.unsqueeze(2) - points.unsqueeze(1)
 
         t = principal_dir.unsqueeze(2)
@@ -27,6 +26,6 @@ class SideGating(nn.Module):
         # Normal consistency
         normal_dot = torch.matmul(normals, normals.transpose(1, 2))
 
-        gate = self.a1 * density_gap.squeeze(-1) + self.a2 * clipped_normal_dist + self.a3 * (1 - normal_dot)
+        gate = self.a1 * density_gap.squeeze(-1) + self.a2 * clipped_normal_dist - self.a3 * (1 - normal_dot)
         gate = torch.sigmoid(gate)
         return gate
