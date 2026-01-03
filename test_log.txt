@@ -1,18 +1,16 @@
+Running with configuration:
+mode: test
+seed: 42
 --- Starting Inference ---
-Saved predictions to: data/predictions/new/T1_aug_1_pred.npz
-Saved predictions to: data/predictions/new/MeshS3_seg_aug_1_pred.npz
-Saved predictions to: data/predictions/new/MeshE1_seg_aug_1_pred.npz
-Saved predictions to: data/predictions/new/wider_aug_1_pred.npz
-Saved predictions to: data/predictions/new/lap2_aug_1_pred.npz
-Saved predictions to: data/predictions/new/MeshS3_inner_aug_1_pred.npz
-Saved predictions to: data/predictions/new/lap1_aug_1_pred.npz
-Saved predictions to: data/predictions/new/T3_aug_1_pred.npz
-Saved predictions to: data/predictions/new/MeshV1_seg_aug_1_pred.npz
-Saved predictions to: data/predictions/new/T2_aug_1_pred.npz
-Saved predictions to: data/predictions/new/normal_aug_1_pred.npz
-Saved predictions to: data/predictions/new/half_v_aug_1_pred.npz
-Saved predictions to: data/predictions/new/MeshE1_inner_aug_1_pred.npz
-Saved predictions to: data/predictions/new/MeshT1_inner_aug_1_pred.npz
-Saved predictions to: data/predictions/new/v_aug_1_pred.npz
-Inference complete.
---- Inference Complete ---
+Traceback (most recent call last):
+  File "/home/zxy/code/weld_seg_project/weld_seg_project/main.py", line 64, in <module>
+    main()
+  File "/home/zxy/code/weld_seg_project/weld_seg_project/main.py", line 60, in main
+    test_model(config)
+  File "/home/zxy/code/weld_seg_project/weld_seg_project/test/recon_test.py", line 60, in test_model
+    recon = model(masked_feat, principal_dir, curv, den, nor, lin, task='recon').squeeze(0)   # [M, C]
+  File "/home/zxy/.conda/envs/weld_seg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/zxy/.conda/envs/weld_seg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+TypeError: GeometryAwareTransformer.forward() missing 1 required positional argument: 'linearity'

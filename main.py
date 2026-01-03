@@ -34,14 +34,14 @@ def main():
         # Fit on training data
         preprocessor.fit(config.RAW_DATA_DIR)
         # Save normalization params for inference
-        preprocessor.save_params("normalization_params.npz")
+        # preprocessor.save_params("normalization_params.npz")
         # Process and save the entire dataset (train/val/test combined here)
         preprocessor.process_and_save_dataset(config.RAW_DATA_DIR, config.PROCESSED_DATA_DIR)
         print("--- Preprocessing Complete ---")
         
     elif args.mode == 'train':
         print("--- Starting Training ---")
-        # run_pretrain(config)
+        run_pretrain(config)
         run_finetune(config)
         print("--- Training Complete ---")
     
