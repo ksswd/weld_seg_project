@@ -33,25 +33,10 @@ class WeldDataset(Dataset):
 
         # Some older .npz files may not include 'normals' or 'local_density' as separate arrays.
         # Provide fallbacks by slicing from the features array when missing.
-        if 'normals' in data:
-            normals = data['normals'].astype(np.float32)
-        else:
-            normals = features[:, 3:6]
-
-        if 'local_density' in data:
-            local_density = data['local_density'].astype(np.float32)
-        else:
-            # rho is at index 7 in features
-            local_density = features[:, 7:8] if features.ndim == 2 else features[:, 7]
-
-        # curvature and principal_dir/linearity should exist; if not, try to extract curvature (kappa) from features
-        if 'curvature' in data:
-            curvature = data['curvature'].astype(np.float32)
-        else:
-            curvature = features[:, 6:7] if features.ndim == 2 else features[:, 6]
-
-        # optional per-point labels for supervised classification (0/1). If missing,
-        # fill with -1 to indicate unlabeled points.
+        coordinate = coordinate = np.stack([data['x'], data['y'], data['z']],axis=1).astype(np.float32)
+        normals = data['normals'].astype(np.float32)
+        local_density = data['local_density'].astype(np.float32)
+        curvature = data['curvature'].astype(np.float32)
         if 'labels' in data:
             labels = data['labels'].astype(np.float32)
             # ensure shape (N,1)
@@ -65,6 +50,7 @@ class WeldDataset(Dataset):
 
         return {
             'features': features,
+            'coordinate': coordinate,
             'principal_dir': principal_dir,
             'curvature': curvature,
             'local_density': local_density,
