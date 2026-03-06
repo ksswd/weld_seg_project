@@ -1,5 +1,51 @@
 # weld_seg_project/train/mask_strategy.py 掩码策略
 import torch
+import numpy as np
+
+class RandomMasker:
+    """完全随机的mask策略"""
+    def __init__(self, mask_ratio=0.1, seed=None):
+        """
+        mask_ratio: fraction of points to mask per-sample
+        seed: optional RNG seed for reproducibility
+        """
+        self.mask_ratio = mask_ratio
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+    def generate_mask(self, curvature, valid_mask=None):
+        """Return a boolean mask of shape (B, N, 1) marking points to mask.
+        
+        Args:
+            curvature: (B, N, 1) - 仅用于获取形状，不使用其值
+            valid_mask: optional (B, N) boolean mask indicating real (non-padding) points.
+        """
+        B, N, _ = curvature.shape
+        mask = torch.zeros_like(curvature, dtype=torch.bool)
+        
+        for b in range(B):
+            if valid_mask is None:
+                valid_idx = torch.arange(N, device=curvature.device)
+            else:
+                valid_idx = torch.nonzero(valid_mask[b], as_tuple=False).squeeze(-1)
+            
+            if valid_idx.numel() == 0:
+                continue
+            
+            num_points_to_mask = max(1, int(valid_idx.numel() * self.mask_ratio))
+            
+            # 随机选择要mask的点
+            if num_points_to_mask >= valid_idx.numel():
+                chosen_idx = valid_idx
+            else:
+                perm = torch.randperm(valid_idx.numel(), device=curvature.device)
+                chosen_idx = valid_idx[perm[:num_points_to_mask]]
+            
+            mask[b, chosen_idx, 0] = True
+        
+        return mask
+
 
 class HighCurvatureMasker:
     def __init__(self, mask_ratio=0.0005, random_frac=0.1, seed=None):

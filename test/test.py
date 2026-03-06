@@ -1,8 +1,9 @@
 import os
 import torch
 import numpy as np
+import pandas as pd
 from model.model import GeometryAwareTransformer
-from utils.io_utils import save_features_to_npz
+from utils.io_utils import save_features_to_npz, load_features_from_csv
 from utils.downsampling import fps_with_cache as fps
 
 def test_model(config):
@@ -11,7 +12,7 @@ def test_model(config):
 
     test_files = [os.path.join(config.TEST_DATA_DIR, f)
                   for f in os.listdir(config.TEST_DATA_DIR)
-                  if f.endswith('.npz') and not f.startswith('T1') and not f.startswith('T2') and not f.startswith('T3')]
+                  if f.endswith('.csv') and '_pred' not in f]
 
     max_points = getattr(config, 'MAX_POINTS', 4096)
 
@@ -25,27 +26,29 @@ def test_model(config):
     curv_gate = getattr(config, 'CURVATURE_GATE', 0)     # 低曲率直接过滤掉
 
     for file_path in test_files:
-        data = np.load(file_path)
-        features = data['features'].astype(np.float32)
-        points = features[..., :3]
-        curv_np = data['curvature'].astype(np.float32)  # [N,1]
-        pd_np = data['principal_dir'].astype(np.float32)  # [N,3]
-        den_np = data['local_density'].astype(np.float32)            # [N,1]
-        nor_np = data['normals'].astype(np.float32)            # [N,3]
-        lin_np = data['linearity'].astype(np.float32)          # [N,1]
+        sample = load_features_from_csv(file_path)
+        features = sample['features'].astype(np.float32)
+        points = sample['coordinate'].astype(np.float32)
+        curv_np = sample['curvature'].astype(np.float32)  # [N,1]
+        pd_np = sample['principal_dir'].astype(np.float32)  # [N,3]
+        den_np = sample['local_density'].astype(np.float32)            # [N,1]
+        nor_np = sample['normals'].astype(np.float32)            # [N,3]
+        lin_np = sample['linearity'].astype(np.float32)          # [N,1]
         
         N = features.shape[0]
-        idxs = fps(points, max_points)
-        features = features[idxs]
-        points = points[idxs]
-        curv_np = curv_np[idxs]
-        den_np = den_np[idxs]
-        nor_np = nor_np[idxs]
-        lin_np = lin_np[idxs]
-        pd_np = pd_np[idxs]
-        
-        
-        preds_binary = np.zeros((min(N, max_points), 1), dtype=np.float32)
+
+        # 如果点数超过最大限制，进行FPS下采样
+        if N > max_points:
+            idxs = fps(points, max_points)
+            features = features[idxs]
+            points = points[idxs]
+            curv_np = curv_np[idxs]
+            den_np = den_np[idxs]
+            nor_np = nor_np[idxs]
+            lin_np = lin_np[idxs]
+            pd_np = pd_np[idxs]
+
+        preds_binary = np.zeros((features.shape[0], 1), dtype=np.float32)
         
         f = torch.from_numpy(features[np.newaxis, ...]).to(device)
         pd = torch.from_numpy(pd_np[np.newaxis, ...]).to(device)
@@ -75,12 +78,20 @@ def test_model(config):
             # ---- 最终阈值 ----
             preds_binary = (probs > thresh).float().cpu().numpy()[:, None]
 
-        # 保存
+        # 保存为CSV格式
         save_path = os.path.join(
             config.PREDICTED_DATA_DIR,
-            os.path.basename(file_path).replace('.npz', '_pred.npz'),
+            os.path.basename(file_path).replace('.csv', '_pred.csv'),
         )
-        save_features_to_npz(np.concatenate([points, preds_binary], axis=1), save_path)
+
+        # 创建包含预测结果的DataFrame
+        df_pred = pd.DataFrame({
+            'x': points[:, 0],
+            'y': points[:, 1],
+            'z': points[:, 2],
+            'prediction': preds_binary[:, 0]
+        })
+        df_pred.to_csv(save_path, index=False)
         print(f"Saved predictions to: {save_path}")
 
     print("Inference complete.")

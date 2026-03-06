@@ -78,12 +78,20 @@ class GeometricFeatureCalculator:
 
     def calculate(self, point_cloud_np):
         """计算所有几何特征"""
+        # 1) 如果传进来的是 Open3D 点云对象，先取出 points 转成 numpy
+        if hasattr(point_cloud_np, "points"):
+            point_cloud_np = np.asarray(point_cloud_np.points)
+
+        # 2) 确保是 numpy 且是 Nx3
+        point_cloud_np = np.asarray(point_cloud_np, dtype=np.float64)
+        if point_cloud_np.ndim != 2 or point_cloud_np.shape[1] != 3:
+            raise ValueError(f"Expected (N,3) points, got {point_cloud_np.shape}")
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(point_cloud_np)
 
         normals, curvature = self.compute_normals_and_curvature(pcd)
         local_density = self.compute_local_density(pcd)
-        # print(local_density)
         linearity = self.compute_linearity(pcd)
         principal_dir = self.get_principal_direction(pcd)
 

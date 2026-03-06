@@ -6,10 +6,10 @@ logs/
 *.out
 *.npz
 weights/
-*.md
 *.txt
 *.csv
 *.png
 data_pre/
 *.npz
-data_pre/
+api/
+weights2/

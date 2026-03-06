@@ -25,6 +25,9 @@ def collate_fn_fps(batch):
         n = item["coordinate"].shape[0]
         k = min(max_points, n)
         idx = fps(item["coordinate"], k)
+        labels_soft_src = item.get("labels_soft", None)
+        if labels_soft_src is None:
+            labels_soft_src = item["labels"]
         sampled.append({
             "features": item["features"][idx],
             "coordinate": item["coordinate"][idx],
@@ -34,6 +37,7 @@ def collate_fn_fps(batch):
             "local_density": item["local_density"][idx],
             "linearity": item["linearity"][idx],
             "labels": item["labels"][idx],
+            "labels_soft": labels_soft_src[idx],
         })
 
     b = len(sampled)
@@ -55,6 +59,7 @@ def collate_fn_fps(batch):
     density = pad([s["local_density"] for s in sampled], (b, max_n, 1))
     linearity = pad([s["linearity"] for s in sampled], (b, max_n, 1))
     labels = pad([s["labels"] for s in sampled], (b, max_n, 1))
+    labels_soft = pad([s["labels_soft"] for s in sampled], (b, max_n, 1))
 
     mask = torch.zeros(b, max_n, dtype=torch.bool)
     for i, s in enumerate(sampled):
@@ -69,6 +74,7 @@ def collate_fn_fps(batch):
         "local_density": torch.from_numpy(density),
         "linearity": torch.from_numpy(linearity),
         "labels": torch.from_numpy(labels),
+        "labels_soft": torch.from_numpy(labels_soft),
         "mask": mask,
     }
 
@@ -137,6 +143,9 @@ def collate_fn(batch):
     sampled = []
     for item in batch:
         idx = choose_indices(item)
+        labels_soft_src = item.get("labels_soft", None)
+        if labels_soft_src is None:
+            labels_soft_src = item["labels"]
         out = {
             "features": item["features"][idx],
             "coordinate": item["coordinate"][idx],
@@ -146,6 +155,7 @@ def collate_fn(batch):
             "local_density": item["local_density"][idx],
             "linearity": item["linearity"][idx],
             "labels": item["labels"][idx],
+            "labels_soft": labels_soft_src[idx],
         }
         sampled.append(out)
 
@@ -169,6 +179,7 @@ def collate_fn(batch):
     density = pad([s["local_density"] for s in sampled], (b, max_n, 1))
     linearity = pad([s["linearity"] for s in sampled], (b, max_n, 1))
     labels = pad([s["labels"] for s in sampled], (b, max_n, 1))
+    labels_soft = pad([s["labels_soft"] for s in sampled], (b, max_n, 1))
 
     mask = torch.zeros(b, max_n, dtype=torch.bool)
     for i, s in enumerate(sampled):
@@ -183,6 +194,7 @@ def collate_fn(batch):
         "local_density": torch.from_numpy(density),
         "linearity": torch.from_numpy(linearity),
         "labels": torch.from_numpy(labels),
+        "labels_soft": torch.from_numpy(labels_soft),
         "mask": mask,
     }
 
@@ -297,22 +309,32 @@ def run_finetune(config):
                 batch['local_density'], batch['normals'], batch['linearity'],
                 task='class'
             )  # (B,N,1)
-            labels = batch['labels']          # (B,N,1)
-            logits_ = logits.squeeze(-1)      # (B,N)
-            labels_ = labels.squeeze(-1)      # (B,N)
-            if label_mask_ratio > 0:
-                keep = (torch.rand_like(labels_) > label_mask_ratio).float()
+            labels_hard = batch['labels']                # (B,N,1) hard labels, for metrics
+            labels_soft = batch.get('labels_soft', None) # (B,N,1) soft labels, optional
+            use_soft_labels = bool(getattr(config, 'USE_SOFT_LABELS', True))
+
+            if (labels_soft is None) or (not use_soft_labels):
+                labels_train = labels_hard
             else:
-                keep = torch.ones_like(labels_)
+                labels_train = labels_soft
+
+            logits_ = logits.squeeze(-1)                 # (B,N)
+            labels_hard_ = labels_hard.squeeze(-1)       # (B,N)
+            labels_train_ = labels_train.squeeze(-1)     # (B,N)
+
+            if label_mask_ratio > 0:
+                keep = (torch.rand_like(labels_train_) > label_mask_ratio).float()
+            else:
+                keep = torch.ones_like(labels_train_)
             keep = keep * valid_mask_f
-            loss_main = per_point_loss(logits_, labels_, keep)
+            loss_main = per_point_loss(logits_, labels_train_, keep)
             # ===== 曲率引导辅助 loss =====
             loss = loss_main
             if curv_aux_w > 0:
                 curv_norm = batch["curvature"].squeeze(-1) / (batch["curvature"].max() + 1e-6)
                 pred_sigmoid = torch.sigmoid(logits_)
                 # Only encourage positives on high-curvature *positive* points to avoid flooding false positives
-                loss_aux = ((1.0 - pred_sigmoid) ** 2 * curv_norm * labels_ * valid_mask_f).sum() / valid_mask_f.sum().clamp(min=1.0)
+                loss_aux = ((1.0 - pred_sigmoid) ** 2 * curv_norm * labels_hard_ * valid_mask_f).sum() / valid_mask_f.sum().clamp(min=1.0)
                 loss = loss + curv_aux_w * loss_aux
             (loss / accum_steps).backward()
 
@@ -357,18 +379,27 @@ def validate(model, loader, device, per_point_loss_fn, config):
         valid_mask_f = valid_mask.float()
         logits = model(batch['features'], batch['coordinate'], batch['principal_dir'], batch['curvature'],
                        batch['local_density'], batch['normals'], batch['linearity'], task='class')
-        labels = batch['labels']
+        labels_hard = batch['labels']
+        labels_soft = batch.get('labels_soft', None)
+        use_soft_labels = bool(getattr(config, 'USE_SOFT_LABELS', True))
+        if (labels_soft is None) or (not use_soft_labels):
+            labels_train = labels_hard
+        else:
+            labels_train = labels_soft
+
         logits_ = logits.squeeze(-1)
-        labels_ = labels.squeeze(-1)
-        keep = torch.ones_like(labels_) * valid_mask_f
-        loss_batch = per_point_loss_fn(logits_, labels_, keep)
+        labels_hard_ = labels_hard.squeeze(-1)
+        labels_train_ = labels_train.squeeze(-1)
+        keep = torch.ones_like(labels_train_) * valid_mask_f
+        loss_batch = per_point_loss_fn(logits_, labels_train_, keep)
         n_labeled = int(valid_mask.sum().item())
 
         total_loss_sum += float(loss_batch.item()) * n_labeled
         total_labeled_pts += n_labeled
 
         probs = torch.sigmoid(logits_).detach().cpu().numpy().reshape(-1)
-        labs = labels_.detach().cpu().numpy().reshape(-1)
+        # 评估指标始终基于硬标签
+        labs = labels_hard_.detach().cpu().numpy().reshape(-1)
         vm = valid_mask.detach().cpu().numpy().reshape(-1).astype(bool)
         probs = probs[vm]
         labs = labs[vm]

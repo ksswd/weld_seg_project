@@ -14,7 +14,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from model.model import GeometryAwareTransformer
-from train.mask_strategy import HighCurvatureMasker
+from train.mask_strategy import HighCurvatureMasker, RandomMasker
+from train.block_segmenter import BlockSegmenter
+from train.block_masker import BlockMasker
 from utils.config import Config
 from utils.io_utils import load_features_from_csv
 
@@ -30,7 +32,7 @@ def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
         return float("nan")
     a = a - a.mean()
     b = b - b.mean()
-    denom = (np.sqrt((a * a).sum()) * np.sqrt((b * b).sum()))
+    denom = np.sqrt((a * a).sum()) * np.sqrt((b * b).sum())
     if denom < 1e-12:
         return float("nan")
     return float((a * b).sum() / denom)
@@ -56,15 +58,13 @@ def compute_recon_metrics(df: pd.DataFrame) -> pd.DataFrame:
       - all points
       - masked points only (mask==1)
       - unmasked points only (mask==0)
+
+    Supports both recon heads:
+      - 1 channel: curvature only
+      - 4 channels: [curvature, x, y, z]
     """
-    required = [
-        "mask",
-        "gt_curvature_raw", "gt_local_density_raw", "gt_linearity",
-        "pred_curvature_raw", "pred_local_density_raw", "pred_linearity",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in recon_vis df: {missing}")
+    if "mask" not in df.columns:
+        raise ValueError("Missing required column 'mask' in recon_vis df")
 
     subsets = {
         "all": np.ones(len(df), dtype=bool),
@@ -72,11 +72,25 @@ def compute_recon_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "unmasked": (df["mask"].to_numpy(dtype=np.int32) == 0),
     }
 
-    channels = [
+    candidate_channels = [
+        ("curvature_target", "gt_curvature_target", "pred_curvature_target"),
+        ("x_target", "gt_x_target", "pred_x_target"),
+        ("y_target", "gt_y_target", "pred_y_target"),
+        ("z_target", "gt_z_target", "pred_z_target"),
+        # backward compatibility with older exported files
         ("curvature_raw", "gt_curvature_raw", "pred_curvature_raw"),
-        ("local_density_raw", "gt_local_density_raw", "pred_local_density_raw"),
-        ("linearity", "gt_linearity", "pred_linearity"),
+        ("x", "gt_x", "pred_x"),
+        ("y", "gt_y", "pred_y"),
+        ("z", "gt_z", "pred_z"),
     ]
+    channels = []
+    for ch_name, gt_col, pred_col in candidate_channels:
+        if gt_col in df.columns and pred_col in df.columns:
+            if not (df[pred_col].isna().all() or df[gt_col].isna().all()):
+                channels.append((ch_name, gt_col, pred_col))
+
+    if not channels:
+        raise ValueError("No valid gt/pred channel pairs found for metric computation")
 
     rows = []
     for subset_name, sel in subsets.items():
@@ -108,14 +122,11 @@ def export_recon_csv(
     write_metrics: bool = True,
 ) -> str:
     """
-    Run the same mask+recon pipeline as pretraining, then export a CSV for visualization.
+    Run mask+recon pipeline close to train/pretrain.py, then export CSV for visualization.
 
-    Recon head outputs 3 channels: [curvature_raw, local_density_raw, linearity].
-    The exported CSV contains:
-      - xyz
-      - mask (0/1)
-      - gt_* and pred_* for the 3 targets
-      - abs_err_* for quick sanity checking
+    Supports recon head output channels:
+      - 1 channel: [curvature_raw]
+      - 4 channels: [curvature_raw, x, y, z]
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(out_dir, exist_ok=True)
@@ -147,7 +158,41 @@ def export_recon_csv(
     linearity = torch.from_numpy(sample["linearity"][None, ...]).to(device)
 
     valid_mask = torch.ones(features.shape[:2], device=device, dtype=torch.bool)  # (1, N)
+
+    # Use the same mask family as pretraining (prefer block-wise when enabled)
+    use_block_mask = bool(getattr(config, "USE_BLOCK_MASK", False))
+    if use_block_mask:
+        segmenter = BlockSegmenter(
+            target_points_per_block=getattr(config, "TARGET_POINTS_PER_BLOCK", 1000),
+            high_curv_threshold=getattr(config, "HIGH_CURV_THRESHOLD", 0.01),
+            min_high_curv_points=getattr(config, "MIN_HIGH_CURV_POINTS", 5),
+            align_grid=True,
+            grid_align_base=getattr(config, "GRID_ALIGN_BASE", 0.001),
+        )
+        block_masker = BlockMasker(
+            mask_ratio=mask_ratio,
+            strategy=getattr(config, "BLOCK_MASK_STRATEGY", "mixed"),
+            weld_mask_ratio=getattr(config, "WELD_MASK_RATIO", None),
+            bg_mask_ratio=getattr(config, "BG_MASK_RATIO", None),
+            seed=seed,
+        )
+
+        valid_indices = torch.nonzero(valid_mask[0], as_tuple=False).squeeze(-1).cpu().numpy()
+        points = coordinate[0, valid_indices].detach().cpu().numpy()
+        curv_np = curvature[0, valid_indices].detach().cpu().numpy()
+        blocks, block_labels = segmenter.segment(points, curv_np)
+        blocks_original = [[int(valid_indices[idx]) for idx in block] for block in blocks]
+
+        mask_1d = block_masker.generate_mask(blocks_original, block_labels, epoch=0).to(device)
+        mask = mask_1d.unsqueeze(0).bool() & valid_mask  # (1, N)
+    else:
+        mask_type = str(getattr(config, "MASK_TYPE", "random")).lower()
+        if mask_type == "random":
+        masker = RandomMasker(mask_ratio=mask_ratio, seed=seed)
+        elif mask_type == "curvature":
     masker = HighCurvatureMasker(mask_ratio=mask_ratio)
+    else:
+            masker = RandomMasker(mask_ratio=mask_ratio, seed=seed)
     mask = masker.generate_mask(curvature, valid_mask=valid_mask).squeeze(-1).bool()  # (1, N)
     mask = mask & valid_mask
 
@@ -167,7 +212,7 @@ def export_recon_csv(
 
     model = GeometryAwareTransformer(config).to(device)
     state = torch.load(weights_path, map_location=device)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=True)
     model.eval()
 
     use_amp = bool(getattr(config, "USE_AMP", False)) and device.type == "cuda"
@@ -199,70 +244,85 @@ def export_recon_csv(
     # Build export dataframe on CPU
     xyz = coordinate.squeeze(0).detach().cpu().numpy()
     m = mask.squeeze(0).detach().cpu().numpy().astype(np.int32)
-    gt = np.concatenate(
-        [
-            curvature.squeeze(0).detach().cpu().numpy(),
-            local_density.squeeze(0).detach().cpu().numpy(),
-            linearity.squeeze(0).detach().cpu().numpy(),
-        ],
-        axis=-1,
-    )
+    
+    gt_curv_raw = curvature.squeeze(0).detach().cpu().numpy()[:, 0]
     pred = recon.squeeze(0).detach().cpu().numpy()
+    out_dim = int(pred.shape[-1])
 
-    # Convert predictions from normalized space back to raw space for visualization/metrics
-    # Curvature: log-space -> raw
-    curv_mode = str(getattr(config, "PRETRAIN_CURV_TARGET", "raw")).lower().strip()
+    # Build targets in the SAME space as train/pretrain.py::recon_criterion
+    curv_mode = str(getattr(config, "PRETRAIN_CURV_TARGET", "log")).lower().strip()
+    eps = float(getattr(config, "PRETRAIN_CURV_EPS", 1e-6))
     if curv_mode == "log":
-        eps = float(getattr(config, "PRETRAIN_CURV_EPS", 1e-6))
+        gt_curv_target = np.log(np.clip(gt_curv_raw, 0.0, None) + eps).astype(np.float32)
+    else:
+        gt_curv_target = gt_curv_raw.astype(np.float32)
+
+    pred_curv_target = pred[:, 0].astype(np.float32)
+
+    data = {
+        "x": xyz[:, 0],
+        "y": xyz[:, 1],
+        "z": xyz[:, 2],
+        "mask": m,
+        # target-space columns (used for metrics)
+        "gt_curvature_target": gt_curv_target,
+        "pred_curvature_target": pred_curv_target,
+        # raw-space columns (used for visualization)
+        "gt_curvature_raw": gt_curv_raw,
+    }
+
+    # Curvature raw-space prediction (for visualization only)
+    if curv_mode == "log":
         pred_curv_raw = np.exp(pred[:, 0].astype(np.float64)) - eps
         pred_curv_raw = np.clip(pred_curv_raw, 0.0, None).astype(np.float32)
     else:
         pred_curv_raw = pred[:, 0].astype(np.float32)
+    data["pred_curvature_raw"] = pred_curv_raw
     
-    # Density: norm-space -> raw (using current sample's min/max for denormalization)
-    dens_mode = str(getattr(config, "PRETRAIN_DENSITY_TARGET", "norm")).lower().strip()
-    gt_dens = gt[:, 1].astype(np.float64)
-    if dens_mode == "norm":
-        dens_min = float(np.min(gt_dens))
-        dens_max = float(np.max(gt_dens))
-        dens_range = max(dens_max - dens_min, 1e-8)
-        pred_dens_raw = pred[:, 1].astype(np.float64) * dens_range + dens_min
-        pred_dens_raw = np.clip(pred_dens_raw, dens_min, dens_max).astype(np.float32)
-    elif dens_mode == "log":
-        pred_dens_raw = np.exp(pred[:, 1].astype(np.float64)) - 1.0
-        pred_dens_raw = np.clip(pred_dens_raw, 0.0, None).astype(np.float32)
-    else:
-        pred_dens_raw = pred[:, 1].astype(np.float32)
+    # Optional xyz channels when recon head outputs 4 dims
+    if out_dim >= 4:
+    coord_min = xyz.min(axis=0, keepdims=True).astype(np.float64)
+    coord_max = xyz.max(axis=0, keepdims=True).astype(np.float64)
+    coord_range = np.maximum(coord_max - coord_min, 1e-8)
     
-    # Linearity: norm-space -> raw (using current sample's min/max for denormalization)
-    lin_mode = str(getattr(config, "PRETRAIN_LINEARITY_TARGET", "norm")).lower().strip()
-    gt_lin = gt[:, 2].astype(np.float64)
-    if lin_mode == "norm":
-        lin_min = float(np.min(gt_lin))
-        lin_max = float(np.max(gt_lin))
-        lin_range = max(lin_max - lin_min, 1e-8)
-        pred_lin_raw = pred[:, 2].astype(np.float64) * lin_range + lin_min
-        pred_lin_raw = np.clip(pred_lin_raw, lin_min, lin_max).astype(np.float32)
-    else:
-        pred_lin_raw = pred[:, 2].astype(np.float32)
+        gt_xyz_target = ((xyz.astype(np.float64) - coord_min) / coord_range).astype(np.float32)
+        pred_xyz_target = pred[:, 1:4].astype(np.float32)
 
-    df = pd.DataFrame(
-        {
-            "x": xyz[:, 0],
-            "y": xyz[:, 1],
-            "z": xyz[:, 2],
-            "mask": m,
-            "gt_curvature_raw": gt[:, 0],
-            "gt_local_density_raw": gt[:, 1],
-            "gt_linearity": gt[:, 2],
-            "pred_curvature_raw": pred_curv_raw,
-            "pred_local_density_raw": pred_dens_raw,
-            "pred_linearity": pred_lin_raw,
+        pred_xyz_raw = (pred[:, 1:4].astype(np.float64) * coord_range + coord_min).astype(np.float32)
+
+        data.update(
+            {
+                # target-space columns (used for metrics)
+                "gt_x_target": gt_xyz_target[:, 0],
+                "gt_y_target": gt_xyz_target[:, 1],
+                "gt_z_target": gt_xyz_target[:, 2],
+                "pred_x_target": pred_xyz_target[:, 0],
+                "pred_y_target": pred_xyz_target[:, 1],
+                "pred_z_target": pred_xyz_target[:, 2],
+                # raw-space columns (used for visualization)
+                "gt_x": xyz[:, 0],
+                "gt_y": xyz[:, 1],
+                "gt_z": xyz[:, 2],
+            "pred_x": pred_xyz_raw[:, 0],
+            "pred_y": pred_xyz_raw[:, 1],
+            "pred_z": pred_xyz_raw[:, 2],
         }
     )
+
+    df = pd.DataFrame(data)
+    # target-space errors (for reliable quantitative analysis)
+    df["abs_err_curvature_target"] = np.abs(df["pred_curvature_target"] - df["gt_curvature_target"])
+    if out_dim >= 4:
+        df["abs_err_x_target"] = np.abs(df["pred_x_target"] - df["gt_x_target"])
+        df["abs_err_y_target"] = np.abs(df["pred_y_target"] - df["gt_y_target"])
+        df["abs_err_z_target"] = np.abs(df["pred_z_target"] - df["gt_z_target"])
+
+    # raw-space errors (for visual inspection)
     df["abs_err_curvature_raw"] = np.abs(df["pred_curvature_raw"] - df["gt_curvature_raw"])
-    df["abs_err_local_density_raw"] = np.abs(df["pred_local_density_raw"] - df["gt_local_density_raw"])
-    df["abs_err_linearity"] = np.abs(df["pred_linearity"] - df["gt_linearity"])
+    if out_dim >= 4:
+    df["abs_err_x"] = np.abs(df["pred_x"] - df["gt_x"])
+    df["abs_err_y"] = np.abs(df["pred_y"] - df["gt_y"])
+    df["abs_err_z"] = np.abs(df["pred_z"] - df["gt_z"])
 
     base = os.path.basename(csv_path).replace(".csv", "")
     out_path = os.path.join(out_dir, f"{base}_recon_vis.csv")
@@ -272,7 +332,6 @@ def export_recon_csv(
         mdf = compute_recon_metrics(df)
         metrics_path = os.path.join(out_dir, f"{base}_recon_metrics.csv")
         mdf.to_csv(metrics_path, index=False)
-        # Print a compact masked-only summary to console
         masked = mdf[mdf["subset"] == "masked"]
         if len(masked):
             print(f"[metrics] masked-only summary for {base}:")
@@ -296,7 +355,6 @@ def main():
     ap.add_argument("--no_metrics", action="store_true", help="Do not write *_recon_metrics.csv")
     args = ap.parse_args()
 
-    # Default to any one processed csv if not specified
     csv_path = args.csv
     if csv_path is None:
         root = Config.PROCESSED_DATA_DIR

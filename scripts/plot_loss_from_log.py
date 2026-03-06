@@ -2,7 +2,7 @@
 """Parse a training log and plot Train Loss and Val Loss per epoch.
 
 Usage:
-    python scripts/plot_loss_from_log.py /path/to/job.41087.out --out loss_plot.png
+    python scripts/plot_loss_from_log.py pretrain_log.txt --out loss_plot.png
 
 This script looks for lines like:
     Epoch 1, Train Loss: 0.5472, Val Loss: 0.5409, ...
@@ -15,7 +15,7 @@ import csv
 import matplotlib.pyplot as plt
 
 
-LOSS_LINE_RE = re.compile(r"Epoch\s+(\d+),\s*Train Loss:\s*([0-9.eE+-]+),\s*Val Loss:\s*([0-9.eE+-]+)")
+LOSS_LINE_RE = re.compile(r"Epoch\s+(\d+)\s+\|\s+Train\s+(\d+\.\d+)\s+\|\s+Val\s+(\d+\.\d+)")
 
 
 def parse_log(path):

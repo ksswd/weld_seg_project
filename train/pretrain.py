@@ -5,9 +5,13 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from model.model import GeometryAwareTransformer
-from train.mask_strategy import HighCurvatureMasker
+from train.mask_strategy import HighCurvatureMasker, RandomMasker
+from train.block_segmenter import BlockSegmenter
+from train.block_masker import BlockMasker
+from train.block_loss import block_recon_criterion as block_loss_fn
 from utils.config import Config as GlobalConfig
 from utils.io_utils import load_features_from_csv
+from utils.downsampling import fps_with_cache as fps
 
 class WeldDataset(Dataset):
     """从CSV文件加载预处理后的点云数据"""
@@ -27,12 +31,12 @@ def collate_fn(batch):
     max_pts = max(item['features'].shape[0] for item in batch)
     max_pts = min(max_pts, global_max) if global_max else max_pts
     # Subsample per-sample to max_pts to avoid bias from "first N points".
-    def maybe_subsample(item, n_keep):
+    def subsample(item, n_keep):
         n = item['features'].shape[0]
         if n <= n_keep:
             return item
-        if subsample_method == 'first':
-            idx = np.arange(n_keep)
+        if subsample_method == 'fps':
+            idx = fps(item['coordinate'], n_keep)
         else:
             # random subsample (fast). Replace with FPS later if needed.
             idx = np.random.choice(n, size=n_keep, replace=False)
@@ -43,7 +47,7 @@ def collate_fn(batch):
             else:
                 out[k] = v[idx]
         return out
-    batch = [maybe_subsample(it, max_pts) for it in batch]
+    batch = [subsample(it, max_pts) for it in batch]
     def pad(arr_list, shape):
         out = np.full(shape, 0.0, dtype=np.float32)
         for i, arr in enumerate(arr_list):
@@ -85,7 +89,39 @@ def run_pretrain(config):
                             shuffle=False, collate_fn=collate_fn, num_workers=getattr(config, 'NUM_WORKERS', 0), pin_memory=True)
 
     model = GeometryAwareTransformer(config).to(device)
-    masker = HighCurvatureMasker(mask_ratio=config.MASK_RATIO)
+    
+    # 根据配置选择mask策略（块级或点级）
+    use_block_mask = getattr(config, 'USE_BLOCK_MASK', False)
+    
+    if use_block_mask:
+        # 块级mask策略
+        segmenter = BlockSegmenter(
+            target_points_per_block=getattr(config, 'TARGET_POINTS_PER_BLOCK', 1000),
+            high_curv_threshold=getattr(config, 'HIGH_CURV_THRESHOLD', 0.01),
+            min_high_curv_points=getattr(config, 'MIN_HIGH_CURV_POINTS', 5),
+            align_grid=True,
+            grid_align_base=getattr(config, 'GRID_ALIGN_BASE', 0.001)
+        )
+        block_masker = BlockMasker(
+            mask_ratio=getattr(config, 'BLOCK_MASK_RATIO', 0.3),
+            strategy=getattr(config, 'BLOCK_MASK_STRATEGY', 'mixed'),  # 'mixed' or 'alternate'
+            weld_mask_ratio=getattr(config, 'WELD_MASK_RATIO', None),
+            bg_mask_ratio=getattr(config, 'BG_MASK_RATIO', None)
+        )
+        masker = None  # 不使用点级masker
+        print("Using block-wise masking strategy")
+    else:
+        # 点级mask策略（原有方式）
+        mask_type = getattr(config, 'MASK_TYPE', 'random').lower()
+        if mask_type == 'random':
+            masker = RandomMasker(mask_ratio=config.MASK_RATIO)
+        elif mask_type == 'curvature':
+            masker = HighCurvatureMasker(mask_ratio=config.MASK_RATIO)
+        else:
+            raise ValueError(f"Unknown MASK_TYPE: {mask_type}. Use 'random' or 'curvature'")
+        segmenter = None
+        block_masker = None
+        print("Using point-wise masking strategy")
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     # Step LR per-iteration to avoid scheduler warnings when AMP skips a step,
     # and to behave consistently regardless of early breaks.
@@ -107,8 +143,51 @@ def run_pretrain(config):
             optimizer.zero_grad(set_to_none=True)
             # 2) 生成 mask & masked input
             valid_mask = batch['mask'].bool()
-            mask = masker.generate_mask(batch['curvature'], valid_mask=valid_mask).squeeze(-1).bool()
-            mask = mask & valid_mask  # never mask padding
+            
+            if use_block_mask:
+                # 块级mask策略
+                # 对每个样本进行块分割
+                blocks_list = []
+                block_labels_list = []
+                masks_list = []
+                
+                for b in range(batch['features'].shape[0]):
+                    # 获取有效点
+                    valid_indices = torch.nonzero(valid_mask[b], as_tuple=False).squeeze(-1).cpu().numpy()
+                    if len(valid_indices) == 0:
+                        blocks_list.append([])
+                        block_labels_list.append([])
+                        masks_list.append(torch.zeros(batch['features'].shape[1], dtype=torch.bool, device=device))
+                        continue
+                    
+                    # 提取有效点的数据
+                    points = batch['coordinate'][b][valid_indices].cpu().numpy()
+                    curvature = batch['curvature'][b][valid_indices].cpu().numpy()
+                    
+                    # 块分割
+                    blocks, block_labels = segmenter.segment(points, curvature)
+                    
+                    # 转换回原始索引
+                    blocks_original = [[int(valid_indices[idx]) for idx in block] for block in blocks]
+                    
+                    # 生成块级mask
+                    mask = block_masker.generate_mask(blocks_original, block_labels, epoch=epoch)
+                    mask = mask.to(device)
+                    # 确保只mask有效点
+                    mask = mask & valid_mask[b]
+                    
+                    blocks_list.append(blocks_original)
+                    block_labels_list.append(block_labels)
+                    masks_list.append(mask)
+                
+                # 合并mask
+                mask = torch.stack(masks_list)  # (B, N)
+            else:
+                # 点级mask策略（原有方式）
+                mask = masker.generate_mask(batch['curvature'], valid_mask=valid_mask).squeeze(-1).bool()
+                mask = mask & valid_mask  # never mask padding
+                blocks_list = None
+                block_labels_list = None
 
             # Mask ALL feature channels that can leak targets (including curvature_norm/density_norm).
             masked_feat = batch['features'].clone()
@@ -131,17 +210,20 @@ def run_pretrain(config):
                 with torch.amp.autocast('cuda'):
                     recon = model(
                         masked_feat,
-                        batch['coordinate'],     # keep coordinates visible; we do NOT regress xyz to avoid leakage
+                        batch['coordinate'],     # coordinates visible as input for spatial context
                         masked_principal,
                         masked_curv,
                         masked_dens,
                         masked_normals,
                         masked_lin,
-                        task='recon'
+                        task='recon'  # outputs: [curvature, x, y, z] for masked points
                     )
                     if not torch.isfinite(recon).all():
                         raise RuntimeError("Non-finite values in model output 'recon'")
-                    loss = recon_criterion(recon, batch, mask)
+                    if use_block_mask:
+                        loss = block_loss_fn(recon, batch, masks_list, blocks_list, block_labels_list)
+                    else:
+                        loss = recon_criterion(recon, batch, mask)
                 scaler.scale(loss).backward()
                 # 在 unscale 之后裁剪梯度
                 scaler.unscale_(optimizer)
@@ -157,17 +239,20 @@ def run_pretrain(config):
             else:
                 recon = model(
                     masked_feat,
-                    batch['coordinate'],
+                    batch['coordinate'],  # coordinates visible as input
                     masked_principal,
                     masked_curv,
                     masked_dens,
                     masked_normals,
                     masked_lin,
-                    task='recon'
+                    task='recon'  # outputs: [curvature, x, y, z]
                 )
                 if not torch.isfinite(recon).all():
                     raise RuntimeError("Non-finite values in model output 'recon' (no AMP)")
-                loss = recon_criterion(recon, batch, mask)
+                if use_block_mask:
+                    loss = block_loss_fn(recon, batch, masks_list, blocks_list, block_labels_list)
+                else:
+                    loss = recon_criterion(recon, batch, mask)
                 if not torch.isfinite(loss):
                     print("Warning: non-finite loss detected (no AMP). setting to zero.")
                     loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
@@ -182,7 +267,10 @@ def run_pretrain(config):
                 break
 
         # 验证、记录、保存与 lr scheduler（与你原逻辑一致）
-        val_loss = validate(model, val_loader, device, masker)
+        if use_block_mask:
+            val_loss = validate_block(model, val_loader, device, segmenter, block_masker, epoch)
+        else:
+            val_loss = validate(model, val_loader, device, masker)
         writer.add_scalar('loss/train', total_loss / len(train_loader.dataset), epoch+1)
         writer.add_scalar('loss/val', val_loss, epoch+1)
         print(f"Epoch {epoch+1} | Train {total_loss/len(train_loader.dataset):.6f} | Val {val_loss:.6f}")
@@ -194,15 +282,31 @@ def run_pretrain(config):
 
 def recon_criterion(recon, batch, mask):
     """
-    Self-supervised reconstruction loss with normalization and per-channel weights.
-    Only compute loss on masked points.
+    Reconstruction loss for pretraining.
+    
+    Note: Both modes are actually "supervised learning" since they use ground truth labels.
+    The difference is in the loss calculation method:
+    
+    - "self_supervised" mode: Uses RMS-balanced weights (dynamic weight adjustment)
+      * effective_weights = base_weights * (1 / RMS_per_channel)
+      * Automatically balances different channels based on their error scales
+      * This is the original approach you were using
+    
+    - "supervised" mode: Uses fixed weights
+      * effective_weights = base_weights (fixed)
+      * Simpler, but may need manual weight tuning
+    
+    Both modes:
+      - Use masked input features
+      - Predict masked regions (curvature + xyz)
+      - Compute MSE loss: (prediction - ground_truth)^2
+      - Only compute loss on masked points
 
-    Target (rotation-invariant):
+    Target:
       - curvature_raw (log-normalized)
-      - local_density_raw (normalized)
-      - linearity (normalized)
+      - x, y, z coordinates (normalized)
     """
-    # recon: (B, N, 3) -> [curvature_target, density_target, linearity_target]
+    # recon: (B, N, 4) -> [curvature_target, x_target, y_target, z_target]
     B, N, _ = recon.shape
     
     # Normalize curvature
@@ -214,60 +318,75 @@ def recon_criterion(recon, batch, mask):
     else:
         curv_t = curv
     
-    # Normalize density
-    dens = batch['local_density']
-    dens_mode = str(getattr(GlobalConfig, "PRETRAIN_DENSITY_TARGET", "norm")).lower().strip()
-    if dens_mode == "norm":
-        # Min-max normalize to [0, 1] for stable training
-        dens_min = dens.min(dim=1, keepdim=True)[0].min(dim=0, keepdim=True)[0]  # (1, 1, 1)
-        dens_max = dens.max(dim=1, keepdim=True)[0].max(dim=0, keepdim=True)[0]  # (1, 1, 1)
-        dens_range = (dens_max - dens_min).clamp_min(1e-8)
-        dens_t = (dens - dens_min) / dens_range
-    elif dens_mode == "log":
-        dens_t = torch.log(dens.clamp_min(1e-8) + 1.0)
-    else:
-        dens_t = dens
-    
-    # Normalize linearity
-    lin = batch['linearity']
-    lin_mode = str(getattr(GlobalConfig, "PRETRAIN_LINEARITY_TARGET", "norm")).lower().strip()
-    if lin_mode == "norm":
-        lin_min = lin.min(dim=1, keepdim=True)[0].min(dim=0, keepdim=True)[0]
-        lin_max = lin.max(dim=1, keepdim=True)[0].max(dim=0, keepdim=True)[0]
-        lin_range = (lin_max - lin_min).clamp_min(1e-8)
-        lin_t = (lin - lin_min) / lin_range
-    else:
-        lin_t = lin
-    
-    # Concatenate targets
-    gt = torch.cat([curv_t, dens_t, lin_t], dim=-1)  # (B, N, 3)
-    
-    # Mask: only compute loss on masked points
-    m = mask.unsqueeze(-1).float()  # (B, N, 1)
-    num_masked = mask.sum().clamp(min=1).float()
-    
-    # Per-channel weights
-    weights = torch.tensor(
-        getattr(GlobalConfig, "PRETRAIN_RECON_WEIGHTS", [1.0, 1.0, 1.0]),
-        device=recon.device,
-        dtype=recon.dtype
-    ).reshape(1, 1, 3)  # (1, 1, 3)
+    # Normalize coordinates (xyz)
+    coord = batch['coordinate']  # (B, N, 3)
+    # Min-max normalize coordinates per batch to [0, 1] for stable training
+    coord_min = coord.min(dim=1, keepdim=True)[0].min(dim=0, keepdim=True)[0]  # (1, 1, 3)
+    coord_max = coord.max(dim=1, keepdim=True)[0].max(dim=0, keepdim=True)[0]  # (1, 1, 3)
+    coord_range = (coord_max - coord_min).clamp_min(1e-8)
+    coord_t = (coord - coord_min) / coord_range  # (B, N, 3)
+
+    # Concatenate targets: [curvature, x, y, z]
+    gt = torch.cat([curv_t, coord_t], dim=-1)  # (B, N, 4)
+
+    # Get training mode
+    train_mode = str(getattr(GlobalConfig, "PRETRAIN_MODE", "self_supervised")).lower()
+
+    if train_mode == "supervised":
+        # Fixed-weight mode: Use fixed weights for all channels
+        # Simpler but may need manual weight tuning
+        m = mask.unsqueeze(-1).float()  # (B, N, 1)
+        num_masked = mask.sum().clamp(min=1).float()
+
+        # Per-channel weights: [curvature, x, y, z]
+        weights = torch.tensor(
+            getattr(GlobalConfig, "PRETRAIN_RECON_WEIGHTS", [2.0, 2.0, 2.0, 2.0]),
+            device=recon.device,
+            dtype=recon.dtype
+        ).reshape(1, 1, 4)  # (1, 1, 4)
+
+        # Compute MSE loss on masked points only
+        diff = (recon - gt) * m  # Only penalize masked points
+        per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (4,)
+
+        # Weighted sum with fixed weights
+        loss = (per_channel_mse * weights.squeeze()).sum()
+
+    elif train_mode == "self_supervised":
+        # RMS-balanced mode: Original approach with dynamic weight adjustment
+        # Automatically balances channels based on their error scales
+        m = mask.unsqueeze(-1).float()  # (B, N, 1)
+        num_masked = mask.sum().clamp(min=1).float()
+        
+            # Per-channel weights: [curvature, x, y, z]
+        weights = torch.tensor(
+                getattr(GlobalConfig, "PRETRAIN_RECON_WEIGHTS", [2.0, 2.0, 2.0, 2.0]),
+            device=recon.device,
+            dtype=recon.dtype
+            ).reshape(1, 1, 4)  # (1, 1, 4)
     
     # Compute per-channel MSE
-    diff = (recon - gt) * m  # (B, N, 3)
-    use_norm_loss = getattr(GlobalConfig, "PRETRAIN_USE_NORM_LOSS", True)
+        diff = (recon - gt) * m
+        use_norm_loss = getattr(GlobalConfig, "PRETRAIN_USE_NORM_LOSS", True)
     
-    if use_norm_loss:
-        # Normalize by per-channel std (computed only on masked points for stability)
-        # This makes loss scale-invariant and helps balance different channels
-        channel_std = (diff ** 2).sum(dim=(0, 1), keepdim=True).sqrt().clamp_min(1e-8)  # (1, 1, 3)
-        norm_diff = diff / channel_std
-        per_channel_mse = (norm_diff ** 2).sum(dim=(0, 1)) / num_masked  # (3,)
+        if use_norm_loss:
+            # Scale weights by per-channel RMS to balance different channels
+            # RMS = sqrt(mean(diff^2)) - this helps balance channels with different scales
+            masked_diff_sq = (diff ** 2).sum(dim=(0, 1))  # (4,) - sum of squared diffs over all points
+            channel_rms = (masked_diff_sq / num_masked).sqrt().clamp_min(1e-8)  # (4,) - RMS per channel
+            # Scale weights inversely with RMS: channels with smaller RMS get higher effective weight
+            rms_weights = 1.0 / channel_rms
+            effective_weights = weights * rms_weights  # (4,) - RMS-balanced weights
+            per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (4,) - raw MSE
+        else:
+            effective_weights = weights
+            per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (4,)
+
+        # Weighted sum with RMS-balanced weights
+        loss = (per_channel_mse * effective_weights.squeeze()).sum()
+
     else:
-        per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (3,)
-    
-    # Weighted sum
-    loss = (per_channel_mse * weights.squeeze()).sum()
+        raise ValueError(f"Unknown PRETRAIN_MODE: {train_mode}. Use 'self_supervised' or 'supervised'")
     
     return loss
 
@@ -307,6 +426,81 @@ def validate(model, loader, device, masker):
             task='recon'
         )
         vloss = recon_criterion(recon, batch, mask)
+        total += vloss.item() * batch['features'].size(0)
+    return total / len(loader.dataset)
+
+@torch.no_grad()
+def validate_block(model, loader, device, segmenter, block_masker, epoch):
+    """块级mask的验证函数"""
+    model.eval()
+    total = 0.0
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        valid_mask = batch['mask'].bool()
+        
+        # 对每个样本进行块分割
+        blocks_list = []
+        block_labels_list = []
+        masks_list = []
+        
+        for b in range(batch['features'].shape[0]):
+            # 获取有效点
+            valid_indices = torch.nonzero(valid_mask[b], as_tuple=False).squeeze(-1).cpu().numpy()
+            if len(valid_indices) == 0:
+                blocks_list.append([])
+                block_labels_list.append([])
+                masks_list.append(torch.zeros(batch['features'].shape[1], dtype=torch.bool, device=device))
+                continue
+            
+            # 提取有效点的数据
+            points = batch['coordinate'][b][valid_indices].cpu().numpy()
+            curvature = batch['curvature'][b][valid_indices].cpu().numpy()
+            
+            # 块分割
+            blocks, block_labels = segmenter.segment(points, curvature)
+            
+            # 转换回原始索引
+            blocks_original = [[int(valid_indices[idx]) for idx in block] for block in blocks]
+            
+            # 生成块级mask
+            mask = block_masker.generate_mask(blocks_original, block_labels, epoch=epoch)
+            mask = mask.to(device)
+            # 确保只mask有效点
+            mask = mask & valid_mask[b]
+            
+            blocks_list.append(blocks_original)
+            block_labels_list.append(block_labels)
+            masks_list.append(mask)
+        
+        # 合并mask
+        mask = torch.stack(masks_list)  # (B, N)
+        
+        # Mask输入
+        masked_feat = batch['features'].clone()
+        masked_feat[mask] = 0.0
+        
+        masked_curv = batch['curvature'].clone()
+        masked_dens = batch['local_density'].clone()
+        masked_lin = batch['linearity'].clone()
+        masked_normals = batch['normals'].clone()
+        masked_principal = batch['principal_dir'].clone()
+        masked_curv[mask] = 0.0
+        masked_dens[mask] = 0.0
+        masked_lin[mask] = 0.0
+        masked_normals[mask] = 0.0
+        masked_principal[mask] = 0.0
+        
+        recon = model(
+            masked_feat,
+            batch['coordinate'],
+            masked_principal,
+            masked_curv,
+            masked_dens,
+            masked_normals,
+            masked_lin,
+            task='recon'
+        )
+        vloss = block_loss_fn(recon, batch, masks_list, blocks_list, block_labels_list)
         total += vloss.item() * batch['features'].size(0)
     return total / len(loader.dataset)
 

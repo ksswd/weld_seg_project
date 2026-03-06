@@ -1,144 +1,117 @@
-# weld_seg_project/utils/config.py 配置文件，用于储存路径和训练参数等
+# weld_seg_project/utils/config.py 配置文件
 from dataclasses import dataclass
+
 @dataclass
 class Config:
-    # --- Data and Preprocessing ---
-    LABEL_DATA_DIR = "data/processed/label"
-    RAW_DATA_DIR = "data/aug_ply"
-    PROCESSED_DATA_DIR = "data/processed_csv"
-    TEST_DATA_DIR = "data/test"  # Using correctly normalized training samples
+    # === 数据路径 ===
+    RAW_DATA_DIR = "data/new/labeled"
+    PROCESSED_DATA_DIR = "data/new/processed_csv_labeled"
+    LABEL_DATA_DIR = "data/new/processed_csv_labeled_soft"
+    TEST_DATA_DIR = "data/test"
     PREDICTED_DATA_DIR = "data/predictions"
-    SPLITS_DIR = "data/splits/new"
+    WEIGHTS_SAVE_DIR = "weights2"
+    LOG_DIR = "logs"
+
+    # === 数据预处理参数 ===
     K_NEIGHBORS = 20
     RADIUS_RATIO = 2.0
 
-    # --- Model Architecture ---
-    # Type of side gate to use
+    # === 模型架构 ===
+    MODEL_TYPE = "transformer"  # "transformer" 或 "mlp" - 模型类型选择
     SIDE_GATE_TYPE = "qwen"
-    # Input feature channels (from preprocessed features: x,y,z,nx,ny,nz,kappa,rho)
     INPUT_DIM = 8
-    # Internal model feature dimension. Must be divisible by N_HEADS.
-    D_MODEL = 12  # increased so it's divisible by 3 when using 3 heads
-    N_HEADS = 3  # T-head, N-head, C-head
-    N_LAYERS = 3 # Geometry -> Local -> Geometry -> Global
-    FFN_DIM = 64 # Feed-forward network dimension in Transformer block
+    D_MODEL = 12
+    N_HEADS = 3
+    N_LAYERS = 3
+    FFN_DIM = 64
 
-    # --- Attention Parameters ---
-    ALPHA0 = 2.0 
+    # === 注意力机制参数 ===
+    ALPHA0 = 2.0
     BETA0 = 0.5
     GAMMA = 1.0
     SIGMA = 0.1
-    WELD_WIDTH_RANGE = [0.005, 0.02] # in meters
+    WELD_WIDTH_RANGE = [0.005, 0.02]
 
-    # --- Training ---
+    # === 训练参数 ===
     BATCH_SIZE = 1
-    LEARNING_RATE = 1e-4  # for pretraining
-    FINETUNE_LR = 1e-4    # learning rate for finetuning (increased from 5e-5 for faster convergence)
+    LEARNING_RATE = 1e-4
+    FINETUNE_LR = 5e-5
     WEIGHT_DECAY = 1e-5
-    NUM_EPOCHS = 300  # increased for better convergence
-    MASK_RATIO = 0.1 # fraction of points to mask per-sample
-    CURVATURE_THRESHOLD = 0.0008 # for pseudo-labeling
-    # Number of DataLoader worker processes. Use 0 on Windows for stability/debug.
+    NUM_EPOCHS = 300
     NUM_WORKERS = 0
 
-    # Focal Loss parameters
-    USE_FOCAL_LOSS = True      # Use Focal Loss instead of BCE (better for extreme imbalance)
-    FOCAL_GAMMA = 2.0          # Focusing parameter (2.0 is standard)
-    FREEZE_BACKBONE = False    # UNFREEZE backbone for this short finetune run
-
-    # If not using focal loss, use BCEWithLogitsLoss with pos_weight (neg/pos) to fight imbalance.
-    USE_POS_WEIGHT = True
-    POS_WEIGHT_MAX = 50.0
-
-    # Maximum points to keep per sample (for downsampling to control attention memory).
-    # NOTE: the training code must implement sampling from this value to take effect.
-    MAX_POINTS = 10000
-
-    # --- Pretraining practicality ---
-    # This repo includes quadratic-attention blocks (Geometry/Global attention).
-    # Pretraining must cap N to keep memory/time reasonable.
-    # Reduced from 8192 to 2048 for memory constraints (O(N^2) attention is expensive)
-    PRETRAIN_MAX_POINTS = 2048
-
-    # Subsampling method when N > *_MAX_POINTS. Options: "random" (fast, default), "first".
-    SUBSAMPLE_METHOD = "random"
-
-    # Use automatic mixed precision (AMP) to reduce memory consumption. Requires
-    # PyTorch with AMP support. The training loop must check USE_AMP to enable it.
+    # === 预训练参数 ===
+    MASK_RATIO = 0.3
+    MASK_TYPE = "random"  # "random" or "curvature" - mask策略类型，随机 or 高曲率
+    PRETRAIN_MAX_POINTS = 15000
+    SUBSAMPLE_METHOD = "fps"
     USE_AMP = True
-
-    # Gradient accumulation steps (keeps physical batch small while simulating larger batch)
     ACCUM_STEPS = 1
-
-    # During finetune, optionally ignore a fraction of point labels (simulate "masked labels").
-    # 0.0 = use all labels; 0.5 = only half points contribute to loss.
-    LABEL_MASK_RATIO = 0.0
-
-    # Optional auxiliary loss that biases high-curvature points towards positive predictions.
-    # WARNING: can introduce many false positives; keep at 0 unless you know it's helping.
-    CURV_AUX_WEIGHT = 0.0
-
-    # Which validation protocol to use for selecting the best checkpoint:
-    # - "fps": validation uses unbiased FPS sampling (recommended)
-    # - "balanced": validation uses label-aware balanced sampling (optimistic; mainly for debugging)
-    MODEL_SELECTION = "fps"
-
-    # If True, training will run only a single batch then exit (useful for debugging)
     DEBUG_SINGLE_BATCH = False
 
-    # --- Inference ---
-    PREDICTION_THRESHOLD = 0.50 # threshold for binary classification from sigmoid output
+    # === 块级预训练参数 ===
+    USE_BLOCK_MASK = True  # 是否使用块级mask（True）还是点级mask（False）
+    TARGET_POINTS_PER_BLOCK = 1000  # 每个块的目标点数
+    HIGH_CURV_THRESHOLD = 0.01  # 高曲率阈值
+    MIN_HIGH_CURV_POINTS = 5  # 高曲率点的最小数量（用于分类块）
+    BLOCK_MASK_RATIO = 0.3  # mask的块比例（当strategy='mixed'时，这是总比例）
+    BLOCK_MASK_STRATEGY = "mixed"  # "mixed"（推荐）或 "alternate"
+    # "mixed": 每个epoch同时mask两种块，让模型同时学习两种任务（推荐）
+    # "alternate": 交替mask（偶数epoch mask焊缝块，奇数epoch mask背景块）
+    WELD_MASK_RATIO = None  # 焊缝块的mask比例（None时使用BLOCK_MASK_RATIO * 0.5）
+    BG_MASK_RATIO = None  # 背景块的mask比例（None时使用BLOCK_MASK_RATIO * 0.5）
+    GRID_ALIGN_BASE = 0.001  # 网格对齐基数（米），使块边界明显
 
-    # --- Finetune balancing & emphasis (temporary experimental settings) ---
-    NEG_TO_POS_RATIO = 2       # target negatives per positive during downsampling
-    MAX_NEG_PER_SAMPLE = 2000  # cap negatives per sample
-    EMPHASIS_FACTOR = 3.0      # increase loss weight for emphasized files (e.g., halfv/lap)
-    EMPHASIS_KEYS = ['halfv', 'half_v', 'lap']
-    CURV_GAIN = 4.0            # curvature channel gain applied during finetune
-    FINETUNE_LR = 5e-5         # smaller lr when unfreezing backbone
-    # NUM_EPOCHS = 2             # short run for experiment
-
-    # --- Paths ---
-    WEIGHTS_SAVE_DIR = "weights"
-    # Logging
-    LOG_DIR = "logs"
-
-    # Reconstruction loss per-channel weights: length must equal INPUT_DIM, or None for equal weights
-    # Example: give more weight to XYZ and curvature
-    # Example default: emphasize XYZ and curvature (kappa at index 6)
-    RECON_WEIGHTS = [0.12, 0.12, 0.12, 0.06, 0.06, 0.06, 0.4, 0.06]
-
-    # Additional weight to add an explicit L1 loss on curvature channel to preserve peaks
-    CURV_L1_WEIGHT = 1.0
-
-    # --- Pretrain recon target scaling ---
-    # Curvature raw is very small (~1e-4..1e-2). Reconstructing in log-space is much more stable.
-    # Options: "raw" or "log"
-    PRETRAIN_CURV_TARGET = "log"
+    # === 预训练重建损失参数 ===
+    PRETRAIN_CURV_TARGET = "raw"
     PRETRAIN_CURV_EPS = 1e-6
-    
-    # Normalization for other channels (density and linearity)
-    # Options: "raw", "norm" (min-max to [0,1]), "log" (for density, use log(1+x))
-    PRETRAIN_DENSITY_TARGET = "norm"  # local_density is in [0,1] range, normalize for better training
-    PRETRAIN_LINEARITY_TARGET = "norm"  # linearity is in [0,1] range, normalize for better training
-    
-    # Per-channel loss weights for reconstruction (curvature, density, linearity)
-    # Higher weight on curvature since it has larger error
-    PRETRAIN_RECON_WEIGHTS = [5.0, 1.0, 1.5]  # [curvature, density, linearity]
-    
-    # Use normalized MSE loss (divide by channel std for stable training)
-    PRETRAIN_USE_NORM_LOSS = True
+    # [curvature, x, y, z] - 增加坐标权重以改善xyz重建效果
+    PRETRAIN_RECON_WEIGHTS = [2.0, 2.0, 2.0, 2.0]  # [curvature, x, y, z]
+    PRETRAIN_USE_NORM_LOSS = True  # 启用RMS归一化以平衡不同通道
 
+    # === 训练模式 ===
+    # 注意：两种模式本质上都是监督学习（都使用真实值作为标签）
+    # 区别在于loss计算方式：
+    # "self_supervised": RMS动态平衡权重 - 自动调整不同通道的权重（原始方法）
+    # "supervised": 固定权重 - 使用固定的权重，需要手动调整
+    PRETRAIN_MODE = "self_supervised"
+
+    # === 微调参数 ===
+    USE_FOCAL_LOSS = True
+    FOCAL_GAMMA = 2.0
+    USE_POS_WEIGHT = True
+    POS_WEIGHT_MAX = 50.0
+    FREEZE_BACKBONE = False
+    LABEL_MASK_RATIO = 0.0
+    CURV_AUX_WEIGHT = 0.0
+    MODEL_SELECTION = "fps"
+    USE_SOFT_LABELS = True  # 微调时是否优先使用label_soft作为loss监督（评估仍用硬标签）
+
+    # === 微调平衡参数 ===
+    NEG_TO_POS_RATIO = 2
+    MAX_NEG_PER_SAMPLE = 2000
+
+    # === 推理参数 ===
+    PREDICTION_THRESHOLD = 0.50
+
+    # === 点云处理 ===
+    MAX_POINTS = 10000
+
+    # === 权重路径 ===
+    PRETRAINED_WEIGHTS = "weights2/best_pretrain1.pth"
+
+    # === 兼容保留（当前代码未直接引用，后续确认后可删除） ===
+    SPLITS_DIR = "data/splits/new"
+    PRETRAIN_DENSITY_TARGET = "norm"
+    PRETRAIN_LINEARITY_TARGET = "norm"
+    RECON_WEIGHTS = [0.12, 0.12, 0.12, 0.06, 0.06, 0.06, 0.4, 0.06]
+    CURV_L1_WEIGHT = 1.0
+    EMPHASIS_FACTOR = 3.0
+    CURV_GAIN = 4.0
+    CURVATURE_THRESHOLD = 0.0008
+    TEST_WEIGHTS = "weights2/best_finetune1.pth"
     SUPERVISED_TRAIN = True
-
     FINETUNE_CLASSIFIER = True
-
     ONLY_USE_LABELED = True
-
     CLASS_LOSS_WEIGHT = 1.0
-
     REINIT_CLASSIFIER_ON_FINETUNE = True
-    
-    PRETRAINED_WEIGHTS = "weights/best_pretrain.pth"
-
-    TEST_WEIGHTS = "weights/best_finetune.pth"
