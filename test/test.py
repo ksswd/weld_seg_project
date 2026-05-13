@@ -3,16 +3,30 @@ import torch
 import numpy as np
 import pandas as pd
 from model.model import GeometryAwareTransformer
-from utils.io_utils import save_features_to_npz, load_features_from_csv
+from utils.io_utils import load_features_from_csv
 from utils.downsampling import fps_with_cache as fps
+from utils.fold_data_split import collect_files_by_fold
 
 def test_model(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(config.PREDICTED_DATA_DIR, exist_ok=True)
 
-    test_files = [os.path.join(config.TEST_DATA_DIR, f)
-                  for f in os.listdir(config.TEST_DATA_DIR)
-                  if f.endswith('.csv') and '_pred' not in f]
+    use_fold_split = bool(getattr(config, 'USE_FOLD_SPLIT', False))
+    if use_fold_split:
+        fold_id = getattr(config, 'FOLD_ID', 'fold_1')
+        strict = bool(getattr(config, 'FOLD_SPLIT_STRICT', True))
+        labeled_dir = getattr(config, 'LABELED_DATA_DIR', config.TEST_DATA_DIR)
+        test_files = collect_files_by_fold(
+            mode='test',
+            fold_id=fold_id,
+            data_dir=labeled_dir,
+            strict=strict,
+            print_stats=True,
+        )
+    else:
+        test_files = [os.path.join(config.TEST_DATA_DIR, f)
+                      for f in os.listdir(config.TEST_DATA_DIR)
+                      if f.endswith('.csv') and '_pred' not in f]
 
     max_points = getattr(config, 'MAX_POINTS', 4096)
 
@@ -21,8 +35,8 @@ def test_model(config):
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    alpha = getattr(config, 'CURVATURE_WEIGHT_ALPHA', 0.3)  # 建议 0.2~0.5
-    thresh = getattr(config, 'PREDICTION_THRESHOLD', 0.5)
+    alpha = getattr(config, 'CURVATURE_WEIGHT_ALPHA', 0.5)  # 建议 0.2~0.5
+    thresh = getattr(config, 'PREDICTION_THRESHOLD', 0.7)
     curv_gate = getattr(config, 'CURVATURE_GATE', 0)     # 低曲率直接过滤掉
 
     for file_path in test_files:
@@ -50,18 +64,28 @@ def test_model(config):
 
         preds_binary = np.zeros((features.shape[0], 1), dtype=np.float32)
         
-        f = torch.from_numpy(features[np.newaxis, ...]).to(device)
-        pd = torch.from_numpy(pd_np[np.newaxis, ...]).to(device)
-        curv = torch.from_numpy(curv_np[np.newaxis, ...]).to(device)  # [1,M,1]
-        den = torch.from_numpy(den_np[np.newaxis, ...]).to(device)
-        nor = torch.from_numpy(nor_np[np.newaxis, ...]).to(device)
-        lin = torch.from_numpy(lin_np[np.newaxis, ...]).to(device)
+        feat_t = torch.from_numpy(features[np.newaxis, ...]).to(device)
+        coord_t = torch.from_numpy(points[np.newaxis, ...]).to(device)
+        principal_t = torch.from_numpy(pd_np[np.newaxis, ...]).to(device)
+        curv_t = torch.from_numpy(curv_np[np.newaxis, ...]).to(device)  # [1,M,1]
+        den_t = torch.from_numpy(den_np[np.newaxis, ...]).to(device)
+        nor_t = torch.from_numpy(nor_np[np.newaxis, ...]).to(device)
+        lin_t = torch.from_numpy(lin_np[np.newaxis, ...]).to(device)
 
         with torch.no_grad():
-            logits = model(f, pd, curv, den, nor, lin, task='class').squeeze(0).squeeze(-1)
+            logits = model(
+                feat_t,
+                coord_t,
+                principal_t,
+                curv_t,
+                den_t,
+                nor_t,
+                lin_t,
+                task='class'
+            ).squeeze(0).squeeze(-1)
 
             # ---- 曲率归一化 ----
-            curv_vec = curv.squeeze(0).squeeze(-1)  # [M]
+            curv_vec = curv_t.squeeze(0).squeeze(-1)  # [M]
             cmin = torch.min(curv_vec)
             cmax = torch.max(curv_vec)
             curv_norm = (curv_vec - cmin) / (cmax - cmin + 1e-8)

@@ -12,6 +12,7 @@ from train.block_loss import block_recon_criterion as block_loss_fn
 from utils.config import Config as GlobalConfig
 from utils.io_utils import load_features_from_csv
 from utils.downsampling import fps_with_cache as fps
+from utils.fold_data_split import collect_files_by_fold
 
 class WeldDataset(Dataset):
     """从CSV文件加载预处理后的点云数据"""
@@ -78,11 +79,33 @@ def collate_fn(batch):
 
 def run_pretrain(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    all_files = [os.path.join(config.PROCESSED_DATA_DIR, f)
-                 for f in os.listdir(config.PROCESSED_DATA_DIR)
-                 if f.endswith('.csv') and '_pred' not in f]
-    train_files = all_files[:int(0.8 * len(all_files))]
-    val_files = all_files[int(0.8 * len(all_files)):]
+    use_fold_split = bool(getattr(config, 'USE_FOLD_SPLIT', False))
+    if use_fold_split:
+        fold_id = getattr(config, 'FOLD_ID', 'fold_1')
+        strict = bool(getattr(config, 'FOLD_SPLIT_STRICT', True))
+        pretrain_dir = getattr(config, 'PRETRAIN_DATA_DIR', config.PROCESSED_DATA_DIR)
+        include_labeled_in_pretrain = bool(getattr(config, 'PRETRAIN_INCLUDE_LABELED', False))
+        train_files = collect_files_by_fold(
+            mode='pretrain',
+            fold_id=fold_id,
+            data_dir=pretrain_dir,
+            include_labeled_in_pretrain=include_labeled_in_pretrain,
+            strict=strict,
+            print_stats=True,
+        )
+        # 预训练验证集仍保持来自训练组（无泄漏前提下切分），用于监控收敛
+        split_idx = max(1, int(0.9 * len(train_files)))
+        val_files = train_files[split_idx:]
+        train_files = train_files[:split_idx]
+        if len(val_files) == 0:
+            val_files = train_files[-1:]
+            train_files = train_files[:-1] if len(train_files) > 1 else train_files
+    else:
+        all_files = [os.path.join(config.PROCESSED_DATA_DIR, f)
+                     for f in os.listdir(config.PROCESSED_DATA_DIR)
+                     if f.endswith('.csv') and '_pred' not in f]
+        train_files = all_files[:int(0.8 * len(all_files))]
+        val_files = all_files[int(0.8 * len(all_files)):]
     train_loader = DataLoader(WeldDataset(train_files), batch_size=config.BATCH_SIZE,
                               shuffle=True, collate_fn=collate_fn, num_workers=getattr(config, 'NUM_WORKERS', 0), pin_memory=True)
     val_loader = DataLoader(WeldDataset(val_files), batch_size=config.BATCH_SIZE,
@@ -282,112 +305,50 @@ def run_pretrain(config):
 
 def recon_criterion(recon, batch, mask):
     """
-    Reconstruction loss for pretraining.
-    
-    Note: Both modes are actually "supervised learning" since they use ground truth labels.
-    The difference is in the loss calculation method:
-    
-    - "self_supervised" mode: Uses RMS-balanced weights (dynamic weight adjustment)
-      * effective_weights = base_weights * (1 / RMS_per_channel)
-      * Automatically balances different channels based on their error scales
-      * This is the original approach you were using
-    
-    - "supervised" mode: Uses fixed weights
-      * effective_weights = base_weights (fixed)
-      * Simpler, but may need manual weight tuning
-    
-    Both modes:
-      - Use masked input features
-      - Predict masked regions (curvature + xyz)
-      - Compute MSE loss: (prediction - ground_truth)^2
-      - Only compute loss on masked points
+    Reconstruction loss for pretraining (curvature-only).
 
-    Target:
-      - curvature_raw (log-normalized)
-      - x, y, z coordinates (normalized)
+    Current recon head outputs one channel (B, N, 1), so this criterion is aligned
+    to curvature-only target to avoid target-head mismatch.
     """
-    # recon: (B, N, 4) -> [curvature_target, x_target, y_target, z_target]
-    B, N, _ = recon.shape
-    
-    # Normalize curvature
+    # recon: (B, N, 1) -> [curvature_target]
+    if recon.shape[-1] != 1:
+        raise ValueError(f"Expected recon last dim = 1 for curvature-only pretrain, got {recon.shape[-1]}")
+
+    # Normalize curvature target
     curv = batch['curvature']
     curv_mode = str(getattr(GlobalConfig, "PRETRAIN_CURV_TARGET", "log")).lower().strip()
     if curv_mode == "log":
         eps = float(getattr(GlobalConfig, "PRETRAIN_CURV_EPS", 1e-6))
-        curv_t = torch.log(curv.clamp_min(0) + eps)
+        gt = torch.log(curv.clamp_min(0) + eps)
     else:
-        curv_t = curv
-    
-    # Normalize coordinates (xyz)
-    coord = batch['coordinate']  # (B, N, 3)
-    # Min-max normalize coordinates per batch to [0, 1] for stable training
-    coord_min = coord.min(dim=1, keepdim=True)[0].min(dim=0, keepdim=True)[0]  # (1, 1, 3)
-    coord_max = coord.max(dim=1, keepdim=True)[0].max(dim=0, keepdim=True)[0]  # (1, 1, 3)
-    coord_range = (coord_max - coord_min).clamp_min(1e-8)
-    coord_t = (coord - coord_min) / coord_range  # (B, N, 3)
+        gt = curv
 
-    # Concatenate targets: [curvature, x, y, z]
-    gt = torch.cat([curv_t, coord_t], dim=-1)  # (B, N, 4)
+    # Masked regression on curvature only
+    m = mask.unsqueeze(-1).float()  # (B, N, 1)
+    num_masked = mask.sum().clamp(min=1).float()
+    diff = (recon - gt) * m
 
-    # Get training mode
     train_mode = str(getattr(GlobalConfig, "PRETRAIN_MODE", "self_supervised")).lower()
 
+    # Use first recon weight for curvature; keep backward compatibility with existing config.
+    recon_weights = getattr(GlobalConfig, "PRETRAIN_RECON_WEIGHTS", [2.0])
+    base_w = float(recon_weights[0]) if len(recon_weights) > 0 else 1.0
+    weight = torch.tensor(base_w, device=recon.device, dtype=recon.dtype)
+
     if train_mode == "supervised":
-        # Fixed-weight mode: Use fixed weights for all channels
-        # Simpler but may need manual weight tuning
-        m = mask.unsqueeze(-1).float()  # (B, N, 1)
-        num_masked = mask.sum().clamp(min=1).float()
-
-        # Per-channel weights: [curvature, x, y, z]
-        weights = torch.tensor(
-            getattr(GlobalConfig, "PRETRAIN_RECON_WEIGHTS", [2.0, 2.0, 2.0, 2.0]),
-            device=recon.device,
-            dtype=recon.dtype
-        ).reshape(1, 1, 4)  # (1, 1, 4)
-
-        # Compute MSE loss on masked points only
-        diff = (recon - gt) * m  # Only penalize masked points
-        per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (4,)
-
-        # Weighted sum with fixed weights
-        loss = (per_channel_mse * weights.squeeze()).sum()
-
+        per_ch_mse = (diff ** 2).sum() / num_masked
+        loss = per_ch_mse * weight
     elif train_mode == "self_supervised":
-        # RMS-balanced mode: Original approach with dynamic weight adjustment
-        # Automatically balances channels based on their error scales
-        m = mask.unsqueeze(-1).float()  # (B, N, 1)
-        num_masked = mask.sum().clamp(min=1).float()
-        
-            # Per-channel weights: [curvature, x, y, z]
-        weights = torch.tensor(
-                getattr(GlobalConfig, "PRETRAIN_RECON_WEIGHTS", [2.0, 2.0, 2.0, 2.0]),
-            device=recon.device,
-            dtype=recon.dtype
-            ).reshape(1, 1, 4)  # (1, 1, 4)
-    
-    # Compute per-channel MSE
-        diff = (recon - gt) * m
-        use_norm_loss = getattr(GlobalConfig, "PRETRAIN_USE_NORM_LOSS", True)
-    
+        per_ch_mse = (diff ** 2).sum() / num_masked
+        use_norm_loss = bool(getattr(GlobalConfig, "PRETRAIN_USE_NORM_LOSS", True))
         if use_norm_loss:
-            # Scale weights by per-channel RMS to balance different channels
-            # RMS = sqrt(mean(diff^2)) - this helps balance channels with different scales
-            masked_diff_sq = (diff ** 2).sum(dim=(0, 1))  # (4,) - sum of squared diffs over all points
-            channel_rms = (masked_diff_sq / num_masked).sqrt().clamp_min(1e-8)  # (4,) - RMS per channel
-            # Scale weights inversely with RMS: channels with smaller RMS get higher effective weight
-            rms_weights = 1.0 / channel_rms
-            effective_weights = weights * rms_weights  # (4,) - RMS-balanced weights
-            per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (4,) - raw MSE
+            rms = per_ch_mse.sqrt().clamp_min(1e-8)
+            loss = per_ch_mse * (weight / rms)
         else:
-            effective_weights = weights
-            per_channel_mse = (diff ** 2).sum(dim=(0, 1)) / num_masked  # (4,)
-
-        # Weighted sum with RMS-balanced weights
-        loss = (per_channel_mse * effective_weights.squeeze()).sum()
-
+            loss = per_ch_mse * weight
     else:
         raise ValueError(f"Unknown PRETRAIN_MODE: {train_mode}. Use 'self_supervised' or 'supervised'")
-    
+
     return loss
 
 

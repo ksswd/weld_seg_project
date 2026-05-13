@@ -1,101 +1,114 @@
 #!/bin/bash
-#SBATCH -o job.%j.out          # 脚本执行的输出将被保存在当job.%j.out文件下，%j表示作业号;
-#SBATCH --partition=titan   # 作业提交的指定分区队列为titan
-#SBATCH --qos=titan           # 指定作业的QOS
-#SBATCH -J weld-seg-job       # 作业在调度系统中的作业名为weld-seg-job
-#SBATCH --nodes=1              # 申请节点数为1,如果作业不能跨节点(MPI)运行, 申请的节点数应不超过1
-#SBATCH --ntasks-per-node=6    # 每个节点上运行一个任务，默认一情况下也可理解为每个节点使用一个核心；
-#SBATCH --gres=gpu:1           # 指定作业的需要的GPU卡数量，集群不一样，注意最大限制; 
+#SBATCH -o job.%j.out
+#SBATCH --partition=v100
+#SBATCH --qos=dcgpu
+#SBATCH -J weld-seg-job
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=6
+#SBATCH --gres=gpu:1
+
+set -e
+
+SIMPLE_THR="0.5"
+MAX_POINTS="4096"
+PASSES="1"
+SEED="114514"
+SOFT_THR="0.5"
+
+# ==============================
+# 路径与评估参数（不使用fold，直接跑指定目录）
+# ==============================
+DATA_DIR="data/dataset_processed"
+OUT_DIR="results/final/dataset_processed_eval"
+WEIGHTS="results/final/fold_1/weights/best_finetune.pth"
+
+  mkdir -p "${OUT_DIR}" "${WEIGHTS_SAVE_DIR}"
+
+  # ==============================
+  # 按fold循环：训练 + 评估 + 可视化 + 指标
+  # ==============================
 
 
-# python main.py --mode preprocess
-# python main.py --mode train
-# python main.py --mode finetune
-# python test/full_eval.py \
-#   --weights weights2/best_finetune.pth \
-#   --data_dir data/new/processed_csv_labeled \
-#   --val_ratio 1.0 \
-#   --max_points 1024 \
-#   --passes 1 \
-#   --seed 42 \
-#   --out_dir data/new/full_eval_all
-# python scripts/visualize_fullpred.py data/new/full_eval_all --out data/new/full_eval_all/vis --thr 0.53 --show_bg
-# python test/per_case_metrics.py \
-#   --input_dir data/new/full_eval_all \
-#   --fixed_thr 0.53
-# python test/plot_case_metrics.py \
-#   --input_dir data/new/full_eval_all \
-#   --thr 0.53 \
-#   --out_png case_metrics_bars_percent_mm.png
-python scripts/visualize_soft_labels.py \
-  --input_dir data/new/processed_csv_labeled_soft \
-  --out_dir data/new/processed_csv_labeled_soft/soft_vis
+echo "=============================================="
+echo "[RUN] dataset_processed (no fold split)"
+echo "=============================================="
 
+  # 训练主流程（按需开启）
+  # python main.py --mode pretrain --fold_id "${FOLD_ID}" --seed "${SEED}" \
+  #   --processed_data_dir "${PROCESSED_DATA_DIR}" \
+  #   --pretrain_data_dir "${PRETRAIN_DATA_DIR}" \
+  #   --weights_save_dir "${WEIGHTS_SAVE_DIR}"
+  # python main.py --mode finetune --fold_id "${FOLD_ID}" --seed "${SEED}" \
+  #   --processed_data_dir "${PROCESSED_DATA_DIR}" \
+  #   --labeled_data_dir "${LABELED_DATA_DIR}" \
+  #   --weights_save_dir "${WEIGHTS_SAVE_DIR}" \
+  #   --pretrained_weights "${PRETRAINED_WEIGHTS}" \
+  #   --test_weights "${TEST_WEIGHTS}"
 
+  # 标准评估：输出到 OUT_DIR/FOLD_ID
+  python main.py --mode full_eval \
+    --fold_id "${FOLD_ID}" \
+    --weights "${WEIGHTS}" \
+    --data_dir "${DATA_DIR}" \
+    --out_dir "${OUT_DIR}" \
+    --max_points "${MAX_POINTS}" \
+    --passes "${PASSES}" \
+    --simple_thr "${SIMPLE_THR}" \
+    --seed "${SEED}" \
+    --processed_data_dir "${PROCESSED_DATA_DIR}" \
+    --weights_save_dir "${WEIGHTS_SAVE_DIR}"
 
+  # 可视化与指标统计
+  # FOLD_OUT_DIR="${OUT_DIR}/${FOLD_ID}"
+  # python scripts/visualize_fullpred.py "${FOLD_OUT_DIR}" --out "${FOLD_OUT_DIR}/vis" --thr "${SIMPLE_THR}" --show_bg
+  # python test/per_case_metrics.py --input_dir "${FOLD_OUT_DIR}" --fixed_thr "${SIMPLE_THR}" --soft_thr "${SOFT_THR}"
+  # python test/plot_case_metrics.py --input_dir "${FOLD_OUT_DIR}" --thr "${SIMPLE_THR}" --out_png "${FOLD_OUT_DIR}/case_metrics_bars_percent_mm.png"
+done
 
+# ==============================
+# 多fold汇总：对各fold的 summary_metrics_global.csv 求平均
+# 输出:
+# 1) summary_metrics_global_all_folds.csv
+# 2) summary_metrics_global_all_folds_avg.csv
+# ==============================
+# python - <<'PY'
+# import os
+# import pandas as pd
 
-# python visualize.py
-# python scripts/plot_loss_from_log.py job.41541.out --out loss_plot.png --csv losses.csv
+# out_dir = "data/new/full_eval3"
+# folds = ["fold_6"]
 
-# python main.py --mode preprocess > preprocess_log.txt 2>&1
-# python main.py --mode train > train_log.txt 2>&1
-# python main.py --mode test > test_log.txt 2>&1
-# python scripts/clahe_enhance.py data/ascii_ply/lap1.ply --out . --ply_text
+# rows = []
+# for fold in folds:
+#     p = os.path.join(out_dir, fold, "summary_metrics_global.csv")
+#     if not os.path.exists(p):
+#         print(f"[WARN] 缺少: {p}")
+#         continue
+#     df = pd.read_csv(p)
+#     if len(df) == 0:
+#         print(f"[WARN] 空文件: {p}")
+#         continue
+#     r = df.iloc[0].copy()
+#     r["fold_id"] = fold
+#     rows.append(r)
 
-# python main.py --mode pretrain > pretrain_log2.txt 2>&1
-# python main.py --mode finetune > finetune_log2.txt 2>&1
-# python test/recon_test.py --csv=data/processed_csv/lap1_aug0.csv
+# if not rows:
+#     raise SystemExit("[ERROR] 没有找到任何 fold 的 summary_metrics_global.csv")
 
+# df_all = pd.DataFrame(rows)
+# all_path = os.path.join(out_dir, "summary_metrics_global_all_folds.csv")
+# df_all.to_csv(all_path, index=False)
 
-# python test/recon_test.py \
-#     --csv data/processed_csv2/lap_weld_aug0.csv \
-#     --weights weights/best_pretrain.pth \
-#     --out_dir data/predictions/recon_vis \
-#     --mask_ratio 0.7 \
-#     --seed 42
-# python scripts/visualize_recon.py data/predictions/recon_vis/lap_weld_aug0_recon_vis.csv --subsample_large
-# python test_model_comparison.py
+# num_cols = df_all.select_dtypes(include="number").columns
+# avg_df = pd.DataFrame([df_all[num_cols].mean(numeric_only=True)])
+# avg_df.insert(0, "n_folds", len(df_all))
+# avg_path = os.path.join(out_dir, "summary_metrics_global_all_folds_avg.csv")
+# avg_df.to_csv(avg_path, index=False)
 
-# === 批量 recon_test + 汇总 + 可视化 ===
-# TEST_DIR="data/new/recon_test/test_files"
-# OUT_DIR="data/new/recon_test/output"
-# WEIGHTS="weights2/best_pretrain.pth"
-# MASK_RATIO=0.3
-# SEED=42
+# print(f"[DONE] all folds metrics  -> {all_path}")
+# print(f"[DONE] mean over folds   -> {avg_path}")
 
-# mkdir -p "$OUT_DIR"
-
-# # 1) 批量运行 recon_test（对 test_files 下每个 csv）
-# for csv in "$TEST_DIR"/*.csv; do
-#   [ -e "$csv" ] || continue
-#   echo "[recon] running: $csv"
-#   python test/recon_test.py \
-#     --csv "$csv" \
-#     --weights "$WEIGHTS" \
-#     --out_dir "$OUT_DIR" \
-#     --mask_ratio "$MASK_RATIO" \
-#     --seed "$SEED"
-# done
-
-# # 2) 汇总所有 *_recon_metrics.csv 为一个总表 + 统计表
-# python -c "import glob,os,pandas as pd; out_dir='$OUT_DIR'; files=sorted(glob.glob(os.path.join(out_dir,'*_recon_metrics.csv'))); assert files, f'No metrics files found in {out_dir}'; frames=[]; \
-# [frames.append(pd.read_csv(f).assign(file=os.path.basename(f).replace('_recon_metrics.csv',''))) for f in files]; \
-# all_df=pd.concat(frames,ignore_index=True); all_path=os.path.join(out_dir,'recon_metrics_all.csv'); all_df.to_csv(all_path,index=False); \
-# summary=all_df.groupby(['subset','channel'],as_index=False).agg(n_files=('file','nunique'), mae_mean=('mae','mean'), mae_std=('mae','std'), rmse_mean=('rmse','mean'), rmse_std=('rmse','std'), corr_mean=('corr','mean'), corr_std=('corr','std')); \
-# sum_path=os.path.join(out_dir,'recon_metrics_summary.csv'); summary.to_csv(sum_path,index=False); print('[summary] wrote:',all_path); print('[summary] wrote:',sum_path)"
-
-# # 3) 生成可视化图（每个样本分析图 + 点云误差图）
-# python scripts/visualize_recon.py "$OUT_DIR" --out "$OUT_DIR" --subsample_large
-
-# # 4) 生成“批量汇总可视化”图片（masked曲率为主）
-# python -c "import os,pandas as pd,matplotlib.pyplot as plt; out_dir='$OUT_DIR'; p=os.path.join(out_dir,'recon_metrics_all.csv'); df=pd.read_csv(p); d=df[(df['subset']=='masked') & (df['channel'].isin(['curvature_target','curvature_raw']))].copy(); \
-# if d.empty: d=df[(df['subset']=='masked')].copy(); d=d.sort_values('file'); \
-# plt.figure(figsize=(12,5)); plt.subplot(1,2,1); plt.bar(d['file'], d['mae']); plt.xticks(rotation=75, fontsize=7); plt.title('Masked MAE by file'); plt.tight_layout(); \
-# plt.subplot(1,2,2); plt.bar(d['file'], d['corr']); plt.xticks(rotation=75, fontsize=7); plt.title('Masked Corr by file'); plt.tight_layout(); \
-# fig_path=os.path.join(out_dir,'recon_metrics_masked_overview.png'); plt.savefig(fig_path,dpi=200,bbox_inches='tight'); print('[summary] wrote:',fig_path)"
-
-# python scripts/make_soft_labels.py \
-#   --input_dir data/new/processed_csv_labeled \
-#   --output_dir data/new/processed_csv_labeled_soft \
-#   --radius 0.2
+# for k in ["hard_weld_iou", "hard_weld_f1", "hard_weld_precision", "hard_weld_recall", "hard_miou", "hard_oa"]:
+#     if k in df_all.columns:
+#         print(f"{k}: mean={df_all[k].mean():.6f}, std={df_all[k].std(ddof=1) if len(df_all)>1 else 0.0:.6f}")
+# PY

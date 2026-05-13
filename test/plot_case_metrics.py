@@ -6,9 +6,6 @@
 1) 准确率（Precision）: TP / (TP + FP)
 2) 完备率（Recall）: TP / (TP + FN)
 3) 错误率（ErrorRate）: (FP + FN) / N
-4) 误差累积量（ErrDistSum）:
-   对每个错误点(y_pred != y_true)，计算其到“最近正确点(y_pred == y_true)”的欧式距离并求和。
-
 图中每个子图标题下方会显示：
 - 总点数N
 - 预测点数量(PredPos=TP+FP)
@@ -24,7 +21,6 @@ from typing import Dict, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.spatial import cKDTree
 
 
 def confusion(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int, int, int, int]:
@@ -37,27 +33,12 @@ def confusion(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int, int, int, in
     return tp, tn, fp, fn
 
 
-def calc_error_distance_sum(xyz: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    err_mask = (y_true != y_pred)
-    ok_mask = ~err_mask
-
-    if err_mask.sum() == 0:
-        return 0.0
-    if ok_mask.sum() == 0:
-        return float("nan")
-
-    tree = cKDTree(xyz[ok_mask])
-    dists, _ = tree.query(xyz[err_mask], k=1, workers=-1)
-    return float(np.sum(dists))
-
-
 def compute_case_metrics(df: pd.DataFrame, thr: float) -> Dict[str, float]:
     required = {"x", "y", "z", "label", "prob"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"输入CSV缺少列: {missing}")
 
-    xyz = df[["x", "y", "z"]].to_numpy(dtype=np.float32)
     y_true = (df["label"].to_numpy(dtype=np.float32) > 0.5).astype(np.int32)
     y_pred = (df["prob"].to_numpy(dtype=np.float32) > thr).astype(np.int32)
 
@@ -67,7 +48,6 @@ def compute_case_metrics(df: pd.DataFrame, thr: float) -> Dict[str, float]:
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     error_rate = (fp + fn) / max(n, 1)
-    err_dist_sum = calc_error_distance_sum(xyz, y_true, y_pred)
 
     return {
         "n_points": int(n),
@@ -79,7 +59,6 @@ def compute_case_metrics(df: pd.DataFrame, thr: float) -> Dict[str, float]:
         "precision": float(precision),
         "recall": float(recall),
         "error_rate": float(error_rate),
-        "err_dist_sum": float(err_dist_sum),
     }
 
 
@@ -94,28 +73,23 @@ def plot_all_cases(case_rows: pd.DataFrame, out_png: str):
     for i, (_, row) in enumerate(case_rows.iterrows()):
         ax = axes[i]
 
-        # 前三项统一转百分比(0-100)，最后一项保持mm
+        # 指标统一转百分比(0-100)
         vals = [
             row["precision"] * 100.0,
             row["recall"] * 100.0,
             row["error_rate"] * 100.0,
-            row["err_dist_sum"],
         ]
-        names = ["Precision(%)", "Recall(%)", "ErrorRate(%)", "ErrDistSum(mm)"]
-        colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444"]
+        names = ["Precision(%)", "Recall(%)", "ErrorRate(%)"]
+        colors = ["#3b82f6", "#10b981", "#f59e0b"]
 
         bars = ax.bar(names, vals, color=colors, alpha=0.9)
         ax.set_xticklabels(names, rotation=25, ha="right")
 
-        for bi, (b, v) in enumerate(zip(bars, vals)):
+        for b, v in zip(bars, vals):
             if np.isnan(v):
                 txt = "NaN"
             else:
-                # 前三项显示百分比，最后一项显示mm
-                if bi < 3:
                     txt = f"{v:.1f}%"
-                else:
-                    txt = f"{v:.1f} mm"
             ax.text(b.get_x() + b.get_width() / 2, b.get_height(), txt,
                     ha="center", va="bottom", fontsize=8)
 

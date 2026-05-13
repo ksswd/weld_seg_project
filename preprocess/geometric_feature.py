@@ -4,7 +4,7 @@ import open3d as o3d
 from scipy.spatial import KDTree
 
 class GeometricFeatureCalculator:
-    def __init__(self, k_neighbors=20, radius_ratio=2.0):
+    def __init__(self, k_neighbors=50, radius_ratio=2.0):
         self.k_neighbors = k_neighbors
         self.radius_ratio = radius_ratio
 
