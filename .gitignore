@@ -13,3 +13,14 @@ data_pre/
 *.npz
 api/
 weights2/
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local editor
+.cursor/
+
+# Generated outputs
+artifacts/
+results/
