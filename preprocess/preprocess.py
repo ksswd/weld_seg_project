@@ -1,4 +1,5 @@
 # weld_seg_project/preprocess/preprocess.py 预处理主函数
+import json
 import os
 
 import numpy as np
@@ -18,6 +19,7 @@ class PointCloudPreprocessor:
         )
         self.mu = None
         self.sigma = None
+        self.standardizer_path = None
 
     def _compute_raw_features(self, point_cloud_np):
         geom = self.feature_calculator.calculate(point_cloud_np)
@@ -55,6 +57,31 @@ class PointCloudPreprocessor:
         self.mu = np.mean(all_features, axis=0)
         self.sigma = np.std(all_features, axis=0)
         self.sigma[self.sigma == 0] = 1.0
+
+    def _save_standardizer(self, output_dir):
+        if self.mu is None or self.sigma is None:
+            raise RuntimeError("Standardizer has not been fitted.")
+        payload = {
+            "mu": self.mu.astype(np.float64).tolist(),
+            "sigma": self.sigma.astype(np.float64).tolist(),
+            "feature_names": ["x", "y", "z", "nx", "ny", "nz", "curvature", "density"],
+        }
+        self.standardizer_path = os.path.join(output_dir, "standardizer.json")
+        with open(self.standardizer_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    def _load_standardizer(self, standardizer_path):
+        with open(standardizer_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        self.mu = np.asarray(payload["mu"], dtype=np.float64)
+        self.sigma = np.asarray(payload["sigma"], dtype=np.float64)
+        self.sigma[self.sigma == 0] = 1.0
+        self.standardizer_path = standardizer_path
+
+    def _inverse_standardize(self, feature_matrix):
+        if self.mu is None or self.sigma is None:
+            raise RuntimeError("Preprocessor has not been fitted.")
+        return feature_matrix * self.sigma + self.mu
 
     def _standardize(self, feature_matrix):
         if not bool(getattr(self.config, "PREPROCESS_STANDARDIZE", False)):
@@ -106,6 +133,7 @@ class PointCloudPreprocessor:
         shuffle_seed = int(getattr(self.config, "SHUFFLE_SEED", 42))
         generate_soft_label = bool(getattr(self.config, "GENERATE_SOFT_LABEL_IN_PREPROCESS", True))
         standardize = bool(getattr(self.config, "PREPROCESS_STANDARDIZE", False))
+        save_standardizer = bool(getattr(self.config, "SAVE_STANDARDIZER", True))
 
         cached = []
         feature_matrices = []
@@ -118,6 +146,8 @@ class PointCloudPreprocessor:
 
         if standardize and len(feature_matrices) > 0:
             self._fit_standardizer(feature_matrices)
+            if save_standardizer:
+                self._save_standardizer(output_dir)
 
         for pc, file_path, raw_data, feature_matrix in cached:
             try:
@@ -154,3 +184,16 @@ class PointCloudPreprocessor:
                 print(f"Processed and saved: {save_path}")
             except Exception as e:
                 print(f"Failed to process {file_path}: {e}")
+
+    def restore_features_from_csv(self, csv_path, standardizer_path=None):
+        standardizer_path = standardizer_path or self.standardizer_path
+        if standardizer_path is None:
+            raise RuntimeError("No standardizer path provided.")
+        if self.mu is None or self.sigma is None or self.standardizer_path != standardizer_path:
+            self._load_standardizer(standardizer_path)
+        df = pd.read_csv(csv_path)
+        cols = ["x", "y", "z", "nx", "ny", "nz", "curvature", "density"]
+        if not all(c in df.columns for c in cols):
+            raise ValueError(f"CSV missing required columns: {cols}")
+        feat = df[cols].to_numpy(dtype=np.float64)
+        return self._inverse_standardize(feat)

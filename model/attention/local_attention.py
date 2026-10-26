@@ -47,6 +47,8 @@ class LocalAttention(nn.Module):
         k = min(self.k_neighbors, N)  # 确保k不超过点数
 
         # 提取xyz坐标用于计算距离
+        if coordinate is None:
+            raise ValueError("LocalAttention requires `coordinate` for k-NN computation, but got None.")
         xyz = coordinate  # (B, N, 3)
 
         # 计算k-NN索引
@@ -58,16 +60,6 @@ class LocalAttention(nn.Module):
         v = self.v_proj(x)  # (B, N, d_model)
 
         # 根据k-NN索引gather邻居的K和V
-        # knn_idx: (B, N, k) -> 扩展到 (B, N, k, d_model)
-        knn_idx_expanded = knn_idx.unsqueeze(-1).expand(-1, -1, -1, self.d_model)
-
-        # (B, N, k, d_model)
-        k_neighbors = torch.gather(
-            k_feat.unsqueeze(2).expand(-1, -1, k, -1),
-            dim=1,
-            index=knn_idx_expanded.transpose(1, 2).reshape(B, -1, self.d_model).unsqueeze(2).expand(-1, -1, k, -1)
-        )
-        # 更简单的gather方式
         k_neighbors = torch.gather(
             k_feat.unsqueeze(1).expand(-1, N, -1, -1),  # (B, N, N, d_model)
             dim=2,

@@ -241,11 +241,34 @@ def run_finetune(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     use_fold_split = bool(getattr(config, 'USE_FOLD_SPLIT', False))
-    if use_fold_split:
+    labeled_dir = getattr(config, 'LABELED_DATA_DIR', config.PROCESSED_DATA_DIR)
+
+    split_train_dir = os.path.join(labeled_dir, 'train')
+    split_val_dir = os.path.join(labeled_dir, 'validation')
+    split_test_dir = os.path.join(labeled_dir, 'test')
+
+    if os.path.isdir(split_train_dir):
+        train_files = sorted([
+            os.path.join(split_train_dir, f)
+            for f in os.listdir(split_train_dir)
+            if f.endswith('.csv') and '_label_' in f
+        ])
+        val_base = split_val_dir if os.path.isdir(split_val_dir) else os.path.join(labeled_dir, 'val')
+        if os.path.isdir(val_base):
+            val_files = sorted([
+                os.path.join(val_base, f)
+                for f in os.listdir(val_base)
+                if f.endswith('.csv') and '_label_' in f
+            ])
+        else:
+            split_idx = max(1, int(0.8 * len(train_files)))
+            val_files = train_files[split_idx:]
+            train_files = train_files[:split_idx]
+        print(f"[Finetune pre-split] train={len(train_files)} val={len(val_files)} dir={labeled_dir}")
+    elif use_fold_split:
         fold_id = getattr(config, 'FOLD_ID', 'fold_1')
         strict = bool(getattr(config, 'FOLD_SPLIT_STRICT', True))
         include_labeled_aug = bool(getattr(config, 'INCLUDE_LABELED_AUG_IN_FINETUNE', False))
-        labeled_dir = getattr(config, 'LABELED_DATA_DIR', config.PROCESSED_DATA_DIR)
 
         train_files = collect_files_by_fold(
             mode='finetune_train',
@@ -297,7 +320,16 @@ def run_finetune(config):
 
     test_files = []
     test_loader = None
-    if use_fold_split:
+    if os.path.isdir(split_test_dir):
+        test_files = sorted([
+            os.path.join(split_test_dir, f)
+            for f in os.listdir(split_test_dir)
+            if f.endswith('.csv') and '_label_' in f
+        ])
+        test_loader = DataLoader(WeldDataset(test_files), batch_size=config.BATCH_SIZE,
+                                 shuffle=False, collate_fn=collate_fn_fps, pin_memory=True)
+        print(f"[Finetune pre-split] test files: {len(test_files)}")
+    elif use_fold_split:
         test_files = collect_files_by_fold(
             mode='test',
             fold_id=fold_id,
@@ -312,12 +344,16 @@ def run_finetune(config):
 
     model = GeometryAwareTransformer(config).to(device)
     # ---------- 加载预训练权重 ----------
+    use_pretrained = bool(getattr(config, 'USE_PRETRAINED_WEIGHTS', True))
     pretrained = getattr(config, 'PRETRAINED_WEIGHTS', None)
-    if pretrained and os.path.isfile(pretrained):
-        model.load_state_dict(torch.load(pretrained, map_location=device), strict=False)
-        print(f"Loaded pretrained weights from {pretrained}")
+    if use_pretrained:
+        if pretrained and os.path.isfile(pretrained):
+            model.load_state_dict(torch.load(pretrained, map_location=device), strict=False)
+            print(f"Loaded pretrained weights from {pretrained}")
+        else:
+                raise FileNotFoundError("PRETRAINED_WEIGHTS not found – required for finetune when USE_PRETRAINED_WEIGHTS=True")
     else:
-        raise FileNotFoundError("PRETRAINED_WEIGHTS not found – required for finetune")
+        print("Finetune without pretrained weights: training from scratch initial weights")
 
     # ---------- FREEZE BACKBONE (only train classifier head) ----------
     freeze_backbone = getattr(config, 'FREEZE_BACKBONE', True)

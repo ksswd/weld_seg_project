@@ -101,9 +101,14 @@ class TransformerModel(nn.Module):
         # odd-index layers use LocalAttention. This gives each layer different context.
         self.attention_layers = nn.ModuleList()
         for i in range(config.N_LAYERS):
-            if i % 3 == 2:
-                attn = GlobalAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)
-            elif i % 3 == 1:
+            # if i == config.N_LAYERS - 1:
+            #     attn = GlobalAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)
+            # elif i % 2 == 1:
+            #     attn = LocalAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)
+            # else:
+            #     attn = MultiHeadGeometryAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)
+            # attn = MultiHeadGeometryAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)
+            if i % 2 == 1:
                 attn = LocalAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)
             else:
                 attn = MultiHeadGeometryAttention(d_model=config.D_MODEL, n_heads=config.N_HEADS, config=config)

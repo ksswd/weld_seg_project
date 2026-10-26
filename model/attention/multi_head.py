@@ -20,6 +20,14 @@ class MultiHeadGeometryAttention(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
+        self.use_geometry_bias = bool(getattr(config, 'USE_GEOMETRY_BIAS', True))
+        self.use_side_gate = bool(getattr(config, 'USE_SIDE_GATE', True))
+        self.use_coordinate = bool(getattr(config, 'USE_COORDINATE_IN_ATTENTION', True))
+        self.use_principal_dir = bool(getattr(config, 'USE_PRINCIPAL_DIR_IN_ATTENTION', True))
+        self.use_curvature = bool(getattr(config, 'USE_CURVATURE_IN_ATTENTION', True))
+        self.use_density = bool(getattr(config, 'USE_DENSITY_IN_ATTENTION', True))
+        self.use_normals = bool(getattr(config, 'USE_NORMALS_IN_ATTENTION', True))
+        self.use_linearity = bool(getattr(config, 'USE_LINEARITY_IN_ATTENTION', True))
         self.aniso_dist = AnisotropicDistance(alpha0=config.ALPHA0, beta0=config.BETA0)
         self.geom_bias = GeometryAttentionBias(gamma=config.GAMMA, sigma=config.SIGMA)
         self.side_gate_type = config.SIDE_GATE_TYPE
@@ -54,21 +62,28 @@ class MultiHeadGeometryAttention(nn.Module):
         # attn_score shape: (B, n_heads, N, N)
         attn_score = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
-        aniso_dist = self.aniso_dist(coordinate, principal_dir, linearity)
-        geom_bias = self.geom_bias(curvature, density, normals, linearity, aniso_dist)
+        if self.use_geometry_bias:
+            aniso_dist = self.aniso_dist(coordinate, principal_dir, linearity)
+            geom_bias = self.geom_bias(curvature, density, normals, linearity, aniso_dist)
+        else:
+            geom_bias = 0.0
         
         # Apply bias and gate
         if self.side_gate_type == 'priori':
-            side_gate = self.side_gate(coordinate, principal_dir, normals, density)
-            attn_score = attn_score + geom_bias.unsqueeze(1)
-            attn_score = attn_score * side_gate.unsqueeze(1)
-            attn_weight = F.softmax(attn_score, dim=-1)
-            attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
+            if self.use_geometry_bias:
+                attn_score = attn_score + geom_bias.unsqueeze(1)
+            if self.use_side_gate:
+                side_gate = self.side_gate(coordinate, principal_dir, normals, density)
+                attn_score = attn_score * side_gate.unsqueeze(1)
+                attn_weight = F.softmax(attn_score, dim=-1)
+                attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
         elif self.side_gate_type == 'qwen':
-            side_gate = self.side_gate(x)
-            attn_score = attn_score + geom_bias.unsqueeze(1)
-            attn_weight = F.softmax(attn_score, dim=-1)
-            attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
-            attn_output = attn_output * side_gate
+            if self.use_geometry_bias:
+                attn_score = attn_score + geom_bias.unsqueeze(1)
+                attn_weight = F.softmax(attn_score, dim=-1)
+                attn_output = (attn_weight @ v).transpose(1, 2).reshape(B, N, C)
+            if self.use_side_gate:
+                side_gate = self.side_gate(x)
+                attn_output = attn_output * side_gate
 
         return self.out_proj(attn_output)

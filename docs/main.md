@@ -56,7 +56,6 @@ f_\theta: \mathbf{p}_i \mapsto y_i\in\{0,1\}
 ### 2.2 配置管理
 统一配置在 `utils/config.py`：
 
-- 数据路径：`RAW_DATA_DIR`、`PROCESSED_DATA_DIR`、`TEST_DATA_DIR` 等；
 - 模型参数：`MODEL_TYPE`、`D_MODEL`、`N_HEADS`、`N_LAYERS`；
 - 预训练参数：`USE_BLOCK_MASK`、`BLOCK_MASK_STRATEGY`、`PRETRAIN_MODE`；
 - 微调参数：`USE_FOCAL_LOSS`、`NEG_TO_POS_RATIO`、`MODEL_SELECTION`；
@@ -119,8 +118,15 @@ Transformer主干层内交替混合三类注意力：
 - 仅使用有标签CSV（文件名含 `_label_`）；
 - 按工件组（去除 `_augXX`）划分 train/val，避免增强泄露；
 - 采样策略优先保留正类点，负类按比例采样；
+- 支持 hard-negative 负样本优先采样（基于负类曲率分位）；
 - 支持 Focal Loss 或带 `pos_weight` 的 BCE；
 - 在验证集上搜索阈值（0~1）并以F1选最优模型。
+
+hard-negative 采样说明（用于抑制搭接焊缝“边缘误检”）：
+- 先从负类点中按曲率分位数划分 hard/easy 两池；
+- hard 池定义：`curvature >= percentile(curvature_neg, HARD_NEG_CURV_PERCENTILE)`；
+- 负类采样时按 `HARD_NEG_RATIO` 优先从 hard 池抽样，不足部分再由 easy/hard 回填；
+- 仍受 `NEG_TO_POS_RATIO` 与 `MAX_NEG_PER_SAMPLE` 约束，保证训练稳定。
 
 ### 2.7 测试与推理（test/test.py）
 流程：
@@ -163,6 +169,57 @@ Transformer主干层内交替混合三类注意力：
   - masked: MAE=9.6731, RMSE=9.9346, Corr=0.5234
   - unmasked: MAE=5.2076, RMSE=5.5715, Corr=0.6144
 - 当前结论：模型已学习到一定相关性（Corr>0.5），但 masked 区域重建误差仍较大，重建质量暂不理想；需继续做多样本复测与目标/损失策略优化。
+
+### 2026-03-07（5-fold group-aware 划分机制）
+- 新增 `utils/fold_data_split.py`，实现固定 `fold_1~fold_5` 的 group 级划分与统一文件收集入口。
+- 适配命名规则：
+  - 无标注增强：`downsampled_weld_{i}_aug_{k}.csv` → `unlabeled_aug`
+  - 有标注（当前主命名）：`downsampled_labeled_{i}_label_*.csv` → `labeled_original`
+  - 兼容命名：`i-k` / `i-labeled` / `i-k-labeled`
+- 新增能力：
+  - `parse_group_id`：统一提取 group_id；
+  - `detect_sample_type`：区分 `unlabeled_aug` / `labeled_original` / `labeled_aug`；
+  - `collect_files_by_fold`：按阶段筛选文件（pretrain / finetune_train / finetune_val / test）；
+  - 防泄漏检查：禁止 train 与 val/test group 交叉、禁止错误类型文件混入；
+  - 统计日志打印：fold、group 列表、按类型与按group计数。
+- 接入改造：
+  - `main.py` 新增 `--fold_id` 参数（可覆盖配置）；
+  - `train/pretrain.py`：预训练文件改为按 fold 的 train groups 仅收集 `unlabeled_aug`；
+  - `train/finetune.py`：微调 train/val 文件改为 fold-aware 收集，val 仅 `labeled_original`；
+  - `test/test.py`：测试文件改为 fold-aware 收集，test 仅 `labeled_original`。
+- 配置新增（`utils/config.py`）：
+  - `USE_FOLD_SPLIT`、`FOLD_ID`、`FOLD_SPLIT_STRICT`、`INCLUDE_LABELED_AUG_IN_FINETUNE`
+  - `PRETRAIN_DATA_DIR`、`LABELED_DATA_DIR`
+- 结果：训练与评估流程从“文件级划分”升级为“原始样本 group 级划分”，显著降低数据泄露风险并提高可复现性。
+
+### 2026-03-08（前两项落地：评估双口径 + soft加权loss）
+- 评估脚本升级：`test/per_case_metrics.py`
+  - 新增 hard/soft 双口径同步统计；
+  - hard：基于 `label`（0/1）计算；
+  - soft-aware：基于 `label_soft > soft_thr` 计算（无 `label_soft` 时自动回退hard）；
+  - 新增参数 `--soft_thr`（默认0.5）；
+  - 全局汇总与逐样例输出均改为 hard/soft 双轨字段。
+- 训练损失升级：`train/finetune.py` + `utils/config.py`
+  - 新增 soft 标签加权loss：边界带降权（`1 - λ·4s(1-s)`） + 高soft区域召回增强（`1 + γ·s`）；
+  - 目标：鼓励焊缝覆盖完整性，同时避免在边界不确定区过拟合硬判定；
+  - 新增配置：
+    - `USE_SOFT_WEIGHTED_LOSS`
+    - `SOFT_BOUNDARY_DOWNWEIGHT_LAMBDA`
+    - `SOFT_RECALL_BOOST_GAMMA`
+- 运行脚本更新：`run.sh`
+  - `per_case_metrics` 增加 `--soft_thr 0.5`，统一输出 hard/soft 两套评估结果。
+
+### 2026-03-09（搭接焊缝误检修正：hard-negative 采样）
+- 采样策略升级：`train/finetune.py`
+  - 在微调 `collate_fn` 中新增 hard-negative 负样本优先采样；
+  - 负类点按曲率分位数切分 hard/easy 两池，优先抽取 hard 池（高曲率非焊缝）；
+  - 仍保持“正类尽量保留 + 负类受比例与上限约束”的整体框架。
+- 配置新增：`utils/config.py`
+  - `HARD_NEG_RATIO`：负类采样中 hard-negative 目标占比（默认 0.6）；
+  - `HARD_NEG_CURV_PERCENTILE`：hard-negative 曲率分位阈值（默认 80）。
+- 动机与预期：
+  - 重点缓解搭接焊缝场景下“把工件边缘预测成焊缝”的系统性误检；
+  - 通过提升困难负样本覆盖，提高模型对“高曲率但非焊缝”区域的判别能力。
 
 ---
 
@@ -264,56 +321,31 @@ Focal形式（可选）：
 
 ## 第五部分：当前情况、问题梳理与任务列表（进行中）
 
-### 5.1 当前情况（基于线激光新数据）
+### 5.1 当前数据说明
 - 数据来源由深度相机迁移到线激光扫描，点云精度和几何结构可辨性显著提升；
 - 新数据对象为铁板拼接焊接结构，覆盖直线/曲线V型、搭接、T型、拐角等焊缝类型；
 - 尺寸量级（单位mm）：板件约 200 × 150，厚度约 3-9，焊缝宽度约 1-3；
 - 经过增强、ROI提取与降采样后，当前可用数据约 1581 条；
 - 已将新数据接入现有流程并开始跑通实验。
-
-### 5.2 当前核心问题（按优先级）
-1. **标注策略未定**：后续监督微调需确定 hard 标签（0/1）还是 soft 标签（概率）。
-2. **局部密度项域迁移问题**：原先基于深度相机的密度假设可能不适用于线激光点云。
-3. **几何先验改造有效性不清晰**：需通过系统消融验证是否真实贡献性能。
-4. **Point Transformer版本对照不足**：需评估与 PTv2/PTv3 思路的一致性与差异。
-5. **工程可维护性问题**：存在冗余代码、冗余参数与历史分支逻辑，影响可读性和迭代效率。
-
-### 5.3 任务列表（后续逐项推进）
-#### Task A：文档与理论对齐（进行中）
-- 基于《开题报告_终稿+修改说明.docx》持续完善本文件第一部分与第四部分。
-
-#### Task B：建立可靠基线（高优先级）
-- 固定数据划分、随机种子与核心指标（F1/Recall/Precision/PR-AUC）；
-- 构建最小可解释基线，作为后续改造对照。
-
-#### Task C：局部密度项重定义（高优先级）
-- 针对线激光采样机制重新评估密度定义、尺度参数与归一化策略；
-- 对比“固定半径计数 / kNN密度 / 局部体素密度”等候选方案。
-
-#### Task D：几何模块消融实验（高优先级）
-- 分别开关各向异性距离项、曲率项、法向项、密度项、线性度项、边侧门控；
-- 输出分模块增益报告，识别无效或负收益模块。
-
-#### Task E：标注方案决策与试标（高优先级）
-- 设计 hard/soft 标签策略与边界不确定区处理规则；
-- 先做小规模试标并验证训练稳定性，再扩大标注规模。
-
-#### Task F：Point Transformer对照升级（中优先级）
-- 对照 PT/PTv2/PTv3 关键设计，确定“最小改造迁移”路线；
-- 保持现有代码可复现前提下逐步替换，而非一次性重构。
-
-#### Task G：代码瘦身与清理（中优先级）
-- 建立“可安全删除”清单（未调用函数、废弃参数、重复实现）；
-- 分批清理并配套回归验证，避免影响主实验链路。
-
-### 5.4 任务推进原则
-- 先解决“数据与监督信号质量”（标注策略、密度定义），再做结构升级；
-- 每次改动必须有可复现实验记录（配置、指标、结论）；
-- 未通过对照实验验证的模块不进入默认主干配置。
-
-### 5.5 线激光监督微调阶段：类型级效果记录（人工检查）
-
-> 数据来源：`data/new/full_eval_all` 预测可视化图（阈值约 0.53），以下结论来自逐样本人工复核。
+- 数据及存储路径
+- 没有预处理的
+  - augmentation ：无标注没有进行降采样的，含有边缘的点云，数据增强80
+  - augmentation2 ：无标注有进行降采样的，含有边缘的点云，数据增强80
+  - augmentation3 ：无标注有进行降采样的，含有边缘的点云，数据增强10
+  - augmentation4 ：有标注有进行降采样的，无边缘的点云，数据增强10 （最新！！！）
+  - augmentation——labeled : 有标注有进行降采样的，含有边缘的点云，数据增强10
+  - noside ： 有标注无边缘点云，无增强
+  - downsample : 无标注降采样有边缘点云，无增强
+  - labeled ： 有标注点云，有边缘
+  - original ： 最原始数据
+- 经过预处理的
+  - processed_csv : 有边缘无标注80增强  
+  - ..3 :  有边缘无标注10增强 
+  - ..4 : 无边缘软标注无增强 
+  - ..5 : 预处理不进行线性化的4
+  - ..labeled : 有边缘有标注无增强 
+  - ..labeled_soft : +软标签 
+  - ..labeled2 : 10增强
 
 #### 样本与类型映射
 1. V型直线焊缝（9mm深）
@@ -332,7 +364,7 @@ Focal形式（可选）：
 14. S形搭接
 15. S形搭接（2层）
 16. S形搭接 + 直线搭接
-17. 拐角焊缝
+17. 拐角焊缝 （弃用，效果差）
 18. T型焊缝
 19. T型焊缝
 
@@ -352,64 +384,111 @@ Focal形式（可选）：
   2. 类型分层评估与重采样训练；
   3. 边缘误检抑制（数据规则 + 训练策略联合改进）。
 
-### 5.6 重建测试实验报告模板（可直接复制填写）
-
-> 用途：评估“快速预训练模型”是否具备可靠的重建能力，并作为是否进入监督微调的依据。
+### 5.6 对比实验
 
 #### A. 实验基本信息
-- 实验日期：
-- 实验人：
-- 模型权重路径：`weight2/best_pretrain.pth`
-- 数据来源：`data/new/recon_test/test_files`
-- 测试样本数量：190
-- 测试脚本：`test/recon_test.py`
-- 关键参数：
-  - `mask_ratio` = 
-  - `seed` = 
-  - `max_points` = 
-  - `USE_BLOCK_MASK` = 
+- 模型权重路径：`weight/best_pretrain.pth` 有边缘预训练+无边缘微调
+- 数据来源：`data/new/` 
+- ours现状:
+  - 存在大量误检,但是召回率较高
+  - 边缘误检+焊缝周围误检 
 
-#### B. 运行命令与输出目录
-- 运行命令：
-- 输出目录：
-- 输出文件说明：
-  - `*_recon_vis.csv`：每点预测结果、mask标记、绝对误差
-  - `*_recon_metrics.csv`：分子集（all/masked/unmasked）统计指标
+- 评价指标
+  - accurancy: 准确率 
+  - recall: 召回率
+  - F1: 
+  - mIoU: 交并比
 
-#### C. 定量结果汇总（重点看 masked 子集）
-- curvature（masked）：
-  - MAE = 
-  - RMSE = 
-  - P90 abs err = 
-  - Corr = 
-- （若有xyz通道）x/y/z（masked）：
-  - x: MAE/RMSE/P90/Corr = 
-  - y: MAE/RMSE/P90/Corr = 
-  - z: MAE/RMSE/P90/Corr = 
+#### B. 对比方法
+- 数学方法:两方法都效果不行
+  - 曲率+法向量阈值
+  - RANSAC+DBScan
+- Pointnet2：无边缘较弱，稍强于未调参的 ours；有边缘很好。env：`pointcept`
+- Point Transformer（Pointcept-copy）：只测了无边缘，效果很好。env：`pointcept`
+- PointMLP：待统一测试脚本测试。env：`pointmlp`
+- PointConv：env：`pointcept`
+- DGCNN：env：`weld_seg`
+- 本项目方法：env：`weld_seg`
 
-可选统计（多样本时建议）：
-- 全测试集 curvature masked-MAE 均值 ± 标准差：
-- 全测试集 curvature masked-RMSE 均值 ± 标准差：
-- 全测试集 curvature masked-Corr 均值 ± 标准差：
+#### C. 下一步可能提高性能的方法
+- 整合我们的机制到PTv3重新做,但是现在初步试了一下效果是负的
+- ptv3也拿无边缘的训练推理,看看效果 没提高多少
+- ours调参? 目前只调了最外端的阈值
+- ours继续加参数量,加层数,堆量,目前的参数量还是太少了 但是加了一些就OOM
+- 预训练也用无边缘的训练 已完成,但没太多提升
+- 要不要预训练?
 
-#### D. 可视化结果（建议至少三图）
-1. 原始点云（参考）
-2. mask分布图（mask=1高亮）
-3. 重建误差热力图（按 `abs_err_curvature_raw` 着色）
+- 指标定位iou
+- 数学方法是否make sense
+- 多个split一起跑,平均,然后再调参
+- 几个baseline，fold1-3一起跑全量，再看效果
+- ours上次跑的无线性化再看看效果和调bug
 
-#### E. 结论与判定
-- 是否达到“可用于下游微调”的最低要求：是 / 否 / 待观察
-- 主要依据：
-- 失败模式（如有）：
-- 下一步动作（只列可执行项）：
-  1) 
-  2) 
-  3) 
+### 5.7 需要优先调整的超参表（预训练 + 微调 + 推理）
 
-#### F. 附录（可选）
-- 关键配置快照（`utils/config.py`相关字段）
-- 测试样本文件列表
-- 额外异常日志
+> 说明：下面这张表优先整理“**不大改逻辑、但最可能影响指标**”的参数。建议先按优先级从高到低逐批扫描，而不是一次性全量网格搜索。
+
+| 优先级 | 参数名 | 当前值 | 建议搜索范围 | 作用阶段 | 说明 |
+|---|---|---:|---|---|---|
+| P0 | `LEARNING_RATE` | `5e-5` | `1e-5, 3e-5, 5e-5, 1e-4, 3e-4` | 预训练 / 微调 | 最优先，通常对收敛和最终指标最敏感 |
+| P0 | `FINETUNE_LR` | `5e-5` | `1e-5, 3e-5, 5e-5, 1e-4` | 微调 | 预训练和微调的最优学习率通常不同 |
+| P0 | `PREDICTION_THRESHOLD` | `0.80` | `0.3 ~ 0.9` | 推理 | 对 Precision / Recall / F1 影响很大，先做验证集搜索 |
+| P0 | `NEG_TO_POS_RATIO` | `2` | `1, 2, 4, 8` | 微调 | 控制类别不平衡，直接影响召回与误检平衡 |
+| P0 | `HARD_NEG_RATIO` | `0.6` | `0.3, 0.5, 0.6, 0.8` | 微调 | 用于抑制“边缘/纹理误检”为焊缝 |
+| P0 | `FOCAL_GAMMA` | `2.0` | `1.0, 2.0, 3.0` | 微调 | focal loss 聚焦难样本强度 |
+| P0 | `USE_FOCAL_LOSS` | `True` | `True / False` | 微调 | 与 BCE / pos_weight 组合做对比 |
+| P0 | `USE_POS_WEIGHT` | `True` | `True / False` | 微调 | 正类稀缺时常有帮助，但需和 focal 联合看 |
+| P0 | `POS_WEIGHT_MAX` | `50.0` | `10, 20, 50` | 微调 | 正类权重上限，避免过度偏置 |
+| P0 | `USE_SOFT_WEIGHTED_LOSS` | `True` | `True / False` | 微调 | 边界软标签加权，适合焊缝边界模糊场景 |
+| P0 | `SOFT_BOUNDARY_DOWNWEIGHT_LAMBDA` | `0.4` | `0.2, 0.4, 0.6` | 微调 | 边界带降权强度 |
+| P0 | `SOFT_RECALL_BOOST_GAMMA` | `1.0` | `0.5, 1.0, 2.0` | 微调 | 高 soft 区域召回增强强度 |
+| P1 | `MASK_RATIO` | `0.3` | `0.15, 0.3, 0.45, 0.6` | 预训练 | 影响预训练难度与表征质量 |
+| P1 | `MASK_TYPE` | `random` | `random / curvature` | 预训练 | 随机 mask 和高曲率 mask 做消融 |
+| P1 | `USE_BLOCK_MASK` | `True` | `True / False` | 预训练 | 块级 mask 与点级 mask 的效果对比 |
+| P1 | `BLOCK_MASK_RATIO` | `0.3` | `0.15, 0.3, 0.45` | 预训练 | 块级预训练中最核心的 mask 强度之一 |
+| P1 | `BLOCK_MASK_STRATEGY` | `mixed` | `mixed / alternate` | 预训练 | 适合做消融，观察 mask 组织方式差异 |
+| P1 | `TARGET_POINTS_PER_BLOCK` | `1000` | `500, 1000, 1500, 2000` | 预训练 | 控制块大小，影响局部上下文与计算量 |
+| P1 | `HIGH_CURV_THRESHOLD` | `0.01` | `0.005, 0.01, 0.02` | 预训练 | 高曲率块判定阈值 |
+| P1 | `MIN_HIGH_CURV_POINTS` | `5` | `3, 5, 10` | 预训练 | 避免高曲率块过于稀疏 |
+| P1 | `D_MODEL` | `32` | `32, 48, 64` | 预训练 / 微调 | 模型容量核心参数，可能存在欠拟合 |
+| P1 | `N_HEADS` | `4` | `4, 8` | 预训练 / 微调 | 与 `D_MODEL` 联动，需保证可整除 |
+| P1 | `N_LAYERS` | `9` | `6, 9, 12` | 预训练 / 微调 | 深度与容量控制 |
+| P1 | `FFN_DIM` | `128` | `128, 256, 512` | 预训练 / 微调 | Transformer 前馈层宽度 |
+| P2 | `K_NEIGHBORS` | `50` | `20, 30, 50, 80` | 预处理 | 邻域大小会影响法向/曲率/密度特征 |
+| P2 | `RADIUS_RATIO` | `2.0` | `1.5, 2.0, 2.5, 3.0` | 预处理 | 局部半径相关，影响密度统计与结构感知 |
+| P2 | `PREPROCESS_STANDARDIZE` | `False` | `False / True` | 预处理 | 是否对预处理特征做全局标准化 |
+| P2 | `PRETRAIN_MAX_POINTS` | `10000` | `4096, 8192, 10000, 12000` | 预训练 | 控制单样本最大点数，影响上下文保留 |
+| P2 | `SUBSAMPLE_METHOD` | `fps` | `fps / random` | 预训练 | 点云子采样策略，影响保真度 |
+| P2 | `PRETRAIN_USE_NORM_LOSS` | `True` | `True / False` | 预训练 | 归一化损失是否启用 |
+| P2 | `PRETRAIN_CURV_TARGET` | `log` | `log / linear`（按代码支持情况） | 预训练 | 曲率重建目标的尺度形式 |
+| P2 | `PRETRAIN_CURV_EPS` | `1e-5` | `1e-6, 1e-5, 1e-4` | 预训练 | 曲率 log 变换稳定项 |
+| P2 | `SOFT_LABEL_RADIUS` | `0.2` | `0.1, 0.2, 0.3` | 微调 | soft label 边界带宽度 |
+| P2 | `CURV_AUX_WEIGHT` | `0.0` | `0.0, 0.1, 0.5, 1.0` | 微调 | 若启用曲率辅助头，可再做扫参 |
+| P2 | `FREEZE_BACKBONE` | `False` | `True / False` | 微调 | 预训练后是否冻结骨干网络 |
+| P2 | `USE_SOFT_LABELS` | `False` | `True / False` | 微调 | 是否使用软标签监督 |
+| P2 | `INCLUDE_LABELED_AUG_IN_FINETUNE` | `True` | `True / False` | 训练划分 | 增强样本是否进入微调训练集 |
+| P3 | `PRETRAIN_INCLUDE_LABELED` | `True` | `True / False` | 预训练 | 是否把同 fold 内有标注样本作为无监督特征学习数据 |
+| P3 | `WELD_WIDTH_RANGE` | `[0.005, 0.02]` | `[0.003, 0.015] / [0.005, 0.02] / [0.01, 0.03]` | 预处理 / 先验 | 焊缝宽度先验范围，可能影响几何门控 |
+| P3 | `ALPHA0` | `2.0` | `1.0, 2.0, 3.0` | 模型先验 | 几何先验强度相关 |
+| P3 | `BETA0` | `0.5` | `0.25, 0.5, 1.0` | 模型先验 | 背景抑制/平衡项相关 |
+| P3 | `GAMMA` | `1.0` | `0.5, 1.0, 2.0` | 模型先验 | 引导强度相关 |
+| P3 | `SIGMA` | `0.1` | `0.05, 0.1, 0.2` | 模型先验 | 平滑/距离衰减相关 |
+| P3 | `CURV_GAIN` | `4.0` | `1.0, 2.0, 4.0, 6.0` | 微调 / 推理 | 曲率引导强度，影响误检和召回 |
+| P3 | `CURVATURE_THRESHOLD` | `0.0008` | `0.0005, 0.0008, 0.001, 0.002` | 推理 | 曲率阈值引导参数 |
+| P3 | `MAX_NEG_PER_SAMPLE` | `2000` | `1000, 2000, 4000` | 微调 | 单样本负类上限，影响训练稳定性 |
+| P3 | `EMPHASIS_FACTOR` | `3.0` | `1.5, 2.0, 3.0, 4.0` | 微调 | 采样/损失强调因子，需结合代码确认生效位置 |
+
+#### 建议的扫参顺序
+1. 先做 **P0**：学习率、采样不平衡、损失、阈值。
+2. 再做 **P1**：预训练 mask 策略与模型容量。
+3. 最后做 **P2/P3**：预处理、先验、推理细项。
+
+#### 实验建议
+- 每次只改一组参数，避免耦合过强导致结论不清晰。
+- 先固定一个 fold 跑通，再对 `fold_1 ~ fold_5` 做平均。
+- 先用验证集搜索 `PREDICTION_THRESHOLD`，再决定最终测试阈值。
+- 对 `USE_FOCAL_LOSS`、`USE_POS_WEIGHT`、`USE_SOFT_WEIGHTED_LOSS` 这类强耦合项，优先做小型组合实验，而不是单独盲扫。
+
 
 ---
 

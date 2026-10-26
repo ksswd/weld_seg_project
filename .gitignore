@@ -24,3 +24,42 @@ __pycache__/
 # Generated outputs
 artifacts/
 results/
+
+# Never publish local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Model checkpoints and generated binary artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npy
+*.pcd
+*.h5
+*.hdf5
+*.so
+*.o
+*.err
+**/checkpoints/
+**/pretrained/
+**/fullpred/
+**/outputs/
+**/wandb/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Keep dependency and license text files versionable
+!requirements*.txt
+!**/requirements*.txt
+!**/LICENSE*
+!**/LICENCE*
+!**/NOTICE*
+!**/COPYING*
+!**/CMakeLists.txt
+

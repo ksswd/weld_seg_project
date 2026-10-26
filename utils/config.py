@@ -12,10 +12,11 @@ class Config:
     WEIGHTS_SAVE_DIR = os.environ.get("WEIGHTS_SAVE_DIR", "results/weights")
     LOG_DIR = os.environ.get("LOG_DIR", "logs") 
     PRETRAINED_WEIGHTS = os.environ.get("PRETRAINED_WEIGHTS", "weights/best_pretrain_800epoches.pth")
+    USE_PRETRAINED_WEIGHTS = os.environ.get("USE_PRETRAINED_WEIGHTS", "True").lower() in ("1", "true", "yes", "y")
     TEST_WEIGHTS = os.environ.get("TEST_WEIGHTS", "results/weights/best_finetune.pth")
 
     # === Fold划分参数 ===
-    USE_FOLD_SPLIT = True
+    USE_FOLD_SPLIT = os.environ.get("USE_FOLD_SPLIT", "True").lower() in ("1", "true", "yes", "y")
     FOLD_ID = os.environ.get("FOLD_ID", "fold_1")
     FOLD_SPLIT_STRICT = True
     INCLUDE_LABELED_AUG_IN_FINETUNE = True
@@ -23,12 +24,14 @@ class Config:
     # === 数据预处理参数 ===
     K_NEIGHBORS = 50
     RADIUS_RATIO = 2.0
-    # 预处理是否做全局z-score标准化（你当前需求：关闭，直接保留原始数值）
+    # 预处理是否做全局z-score标准化（如果需要保存/复原坐标，保持开启；否则关闭）
     PREPROCESS_STANDARDIZE = True
+    SAVE_STANDARDIZER = True
+    STANDARDIZER_PATH = os.environ.get("STANDARDIZER_PATH", "")
 
     # === 模型架构 ===
     MODEL_TYPE = "transformer"  # "transformer" 或 "mlp"
-    SIDE_GATE_TYPE = "qwen"
+    SIDE_GATE_TYPE = os.environ.get("SIDE_GATE_TYPE", "qwen")
     INPUT_DIM = 8
     D_MODEL = 32
     N_HEADS = 4
@@ -36,11 +39,19 @@ class Config:
     FFN_DIM = 128
 
     # === 注意力机制参数 ===
-    ALPHA0 = 2.0
-    BETA0 = 0.5
-    GAMMA = 1.0
+    ALPHA0 = float(os.environ.get("ALPHA0", "2.0"))
+    BETA0 = float(os.environ.get("BETA0", "0.5"))
+    GAMMA = float(os.environ.get("GAMMA", "1.0"))
     SIGMA = 0.1
     WELD_WIDTH_RANGE = [0.005, 0.02]
+    USE_GEOMETRY_BIAS = os.environ.get("USE_GEOMETRY_BIAS", "True").lower() in ("1", "true", "yes", "y")
+    USE_SIDE_GATE = os.environ.get("USE_SIDE_GATE", "True").lower() in ("1", "true", "yes", "y")
+    USE_COORDINATE_IN_ATTENTION = True
+    USE_PRINCIPAL_DIR_IN_ATTENTION = True
+    USE_CURVATURE_IN_ATTENTION = True
+    USE_DENSITY_IN_ATTENTION = True
+    USE_NORMALS_IN_ATTENTION = True
+    USE_LINEARITY_IN_ATTENTION = True
 
     # === 训练参数 ===
     BATCH_SIZE = 1 ## batch怎么改
